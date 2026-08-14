@@ -1,0 +1,13 @@
+[Unit]
+Description=Obsidian @hermes mention watcher
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/obsidian-hermes-watcher.env
+ExecStart=%h/.hermes/venvs/obsidian-watcher/bin/python %h/.hermes/scripts/obsidian-mention-watcher.py
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
