@@ -106,7 +106,7 @@ To re-trigger a mention, edit its tag back to bare `@hermes` and save.
 
 - **Never write the bare tag in prose in any vault note** — including docs about this feature. Use a code fence or write `@hermes/done`. (Yes, this repo's watcher triggered on its own documentation. Twice.)
 - **Telegram forum-topic delivery:** if pings land outside your topics, your `thread_id` is probably stale — topics get recreated and keep their old IDs in config. Probe with raw Bot API `sendMessage` to find the live ID.
-- Webhook agent runs have Hermes' 3-minute interrupt cap — very deep research may need a v2 pattern where the run schedules a background job.
+- Webhook agent runs use Hermes' standard gateway timeout (`agent.gateway_timeout`, default 30 min of *inactivity* — resets on every tool call), so long research tasks are fine. Each webhook delivery runs in its own isolated agent session.
 
 ## Deploying changes
 

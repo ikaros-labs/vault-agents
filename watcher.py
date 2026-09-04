@@ -7,6 +7,15 @@ bare `@hermes` mention (not @hermes/ack or @hermes/done), it:
   2. POSTs {note_path, mention_line, mention_id, context} to the Hermes
      webhook endpoint with a generic V2 HMAC signature.
 
+Dispatch rules ("Enter = send"):
+  - A mention followed by ANY further line (even blank / trailing newline)
+    is considered finished -> dispatched on the normal debounce.
+  - A mention on the very last line of the file (no newline after it) is
+    probably still being typed -> held until the whole file has been quiet
+    for STABILITY_SECONDS, then dispatched.
+This prevents acking half-written sentences while the author (or sync)
+is still delivering the line.
+
 Run as a systemd user service. Config via env vars (see unit file):
   VAULT_PATH, WEBHOOK_URL, WEBHOOK_SECRET
 """
@@ -30,6 +39,7 @@ VAULT = Path(os.environ.get("VAULT_PATH", os.path.expanduser("~/obsidian-vault")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "http://localhost:8644/webhooks/obsidian-mention")
 SECRET = os.environ.get("WEBHOOK_SECRET", "")
 DEBOUNCE_SECONDS = 3.0
+STABILITY_SECONDS = 8.0  # quiet time required for a trailing-line mention
 CONTEXT_LINES = 20
 IGNORE_DIRS = {".git", ".obsidian", ".trash", "templates"}
 
@@ -42,6 +52,12 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 log = logging.getLogger("obsidian-watcher")
+
+# Trailing-line mentions waiting for the file to go quiet:
+#   path_str -> (full_text_sha1, first_seen_monotonic)
+_pending = {}
+_pending_timers = {}
+_pending_lock = threading.Lock()
 
 
 def is_ignored(path: Path) -> bool:
@@ -87,7 +103,36 @@ def post_webhook(payload: dict) -> bool:
     return False
 
 
-def process_file(path: Path):
+def _clear_pending(path_str: str):
+    with _pending_lock:
+        _pending.pop(path_str, None)
+        t = _pending_timers.pop(path_str, None)
+        if t:
+            t.cancel()
+
+
+def _schedule_recheck(path_str: str, delay: float):
+    """Re-run process_file after `delay` to re-evaluate a held trailing mention."""
+    with _pending_lock:
+        t = _pending_timers.pop(path_str, None)
+        if t:
+            t.cancel()
+        timer = threading.Timer(delay, _recheck, args=(path_str,))
+        timer.daemon = True
+        _pending_timers[path_str] = timer
+        timer.start()
+
+
+def _recheck(path_str: str):
+    with _pending_lock:
+        _pending_timers.pop(path_str, None)
+    p = Path(path_str)
+    if p.exists():
+        process_file(p)
+
+
+def process_file(path: Path, assume_finished: bool = False):
+    path_str = str(path)
     try:
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as e:
@@ -96,11 +141,54 @@ def process_file(path: Path):
     lines = text.split("\n")
     hits = list(find_mentions(lines))
     if not hits:
+        _clear_pending(path_str)
         return
 
-    # Ack all bare mentions first (atomic-ish dedup), then POST each.
-    events = []
+    last_line_idx = len(lines) - 1
+    ready, trailing = [], []
     for idx, line in hits:
+        # "Enter = send": anything after the mention line (even a trailing
+        # newline, which split() turns into a final "" element) means the
+        # author moved on -> finished.
+        if assume_finished or idx < last_line_idx:
+            ready.append((idx, line))
+        else:
+            trailing.append((idx, line))
+
+    if trailing and not ready:
+        # Only a trailing-line mention: hold until the file is quiet.
+        text_hash = hashlib.sha1(text.encode()).hexdigest()
+        now = time.monotonic()
+        with _pending_lock:
+            prev = _pending.get(path_str)
+        if prev and prev[0] == text_hash:
+            if now - prev[1] >= STABILITY_SECONDS:
+                log.info("trailing mention in %s stable for %.0fs -> dispatching", path, now - prev[1])
+                ready.extend(trailing)
+                trailing = []
+                _clear_pending(path_str)
+            else:
+                _schedule_recheck(path_str, STABILITY_SECONDS - (now - prev[1]) + 0.5)
+                return
+        else:
+            with _pending_lock:
+                _pending[path_str] = (text_hash, now)
+            log.info("trailing mention in %s — holding for %.0fs of quiet", path, STABILITY_SECONDS)
+            _schedule_recheck(path_str, STABILITY_SECONDS + 0.5)
+            return
+    elif trailing and ready:
+        # Mixed: dispatch the finished ones now; the trailing one re-enters
+        # the hold cycle on the next pass (file will change when we ack).
+        pass
+    else:
+        _clear_pending(path_str)
+
+    if not ready:
+        return
+
+    # Ack the ready mentions (atomic-ish dedup), then POST each.
+    events = []
+    for idx, line in ready:
         mention_id = hashlib.sha1(f"{path}:{idx}:{line}:{time.time()}".encode()).hexdigest()[:10]
         acked = MENTION_RE.sub("@hermes/ack", line, count=1)
         lines[idx] = acked
@@ -108,11 +196,24 @@ def process_file(path: Path):
         events.append({
             "event_type": "obsidian_mention",
             "mention_id": mention_id,
-            "note_path": str(path),
+            "note_path": path_str,
             "line_number": idx + 1,
             "mention_line": acked,
             "context": "\n".join(lines[lo:hi]),
         })
+
+    # Sync-collision guard: verify the file hasn't changed since we read it.
+    # If it has (Obsidian Sync delivered more edits mid-decision), abort and
+    # re-evaluate on the fresh content instead of writing over it.
+    try:
+        current = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as e:
+        log.warning("re-read failed for %s: %s — aborting ack", path, e)
+        return
+    if current != text:
+        log.info("%s changed while deciding — re-evaluating", path)
+        _schedule_recheck(path_str, DEBOUNCE_SECONDS)
+        return
 
     try:
         path.write_text("\n".join(lines), encoding="utf-8")
@@ -167,7 +268,7 @@ class Handler(FileSystemEventHandler):
 
 
 def initial_scan():
-    """Catch mentions written while the watcher was down."""
+    """Catch mentions written while the watcher was down (always finished)."""
     count = 0
     for p in VAULT.rglob("*.md"):
         if is_ignored(p):
@@ -177,7 +278,7 @@ def initial_scan():
         except (OSError, UnicodeDecodeError):
             continue
         if any(True for _ in find_mentions(lines)):
-            process_file(p)
+            process_file(p, assume_finished=True)
             count += 1
     if count:
         log.info("initial scan: processed %d file(s) with pending mentions", count)
@@ -190,7 +291,8 @@ def main():
     if not VAULT.is_dir():
         log.error("vault not found: %s", VAULT)
         sys.exit(1)
-    log.info("watching %s -> %s", VAULT, WEBHOOK_URL)
+    log.info("watching %s -> %s (debounce %.0fs, trailing-line stability %.0fs)",
+             VAULT, WEBHOOK_URL, DEBOUNCE_SECONDS, STABILITY_SECONDS)
     initial_scan()
     observer = Observer()
     observer.schedule(Handler(), str(VAULT), recursive=True)
