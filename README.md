@@ -1,16 +1,19 @@
 # obsidian-hermes
 
-Tag your AI agent inside any Obsidian note. Write `@hermes <request>` on any line, save, and within seconds the agent acknowledges it in-place, does the work, and replies inline in the note — turning your vault into a first-class communication channel with [Hermes Agent](https://github.com/NousResearch/hermes-agent).
+Tag AI agents inside any Obsidian note. Write `@hermes <request>` (or `@claude` / `@codex`) on any line, save, and within seconds the agent acknowledges it in-place, does the work, and replies inline in the note — turning your vault into a first-class communication channel with [Hermes Agent](https://github.com/NousResearch/hermes-agent), [Claude Code](https://code.claude.com), and [Codex CLI](https://github.com/openai/codex).
 
 ```
 note save
   → watcher daemon (inotify via Python watchdog)
-  → flips bare @hermes → @hermes/ack in the note   (dedup + visual receipt)
-  → POST to Hermes webhook (HMAC-signed)
-  → agent run: reads the full note, does the task
-  → inline reply below the mention:  > 🤖 **hermes** (date): ...
-  → flips @hermes/ack → @hermes/done
-  → short summary delivered to your chat platform (Telegram etc.)
+  → "Enter = send": mentions still being typed on the last line are held
+  → flips bare @<agent> → @<agent>/ack in the note   (dedup + visual receipt)
+  → dispatch:
+      @hermes → POST to Hermes webhook (HMAC-signed) → agent run replies inline,
+                flips /done, pings your chat platform
+      @claude → runs `claude -p` directly; watcher writes the inline reply
+      @codex  → runs `codex exec` directly; watcher writes the inline reply
+  → inline reply below the mention:  > 🤖 **<agent>** (date): ...
+  → tag flips to /done (or /err on failure — edit back to bare tag to retry)
 ```
 
 ## Mention lifecycle
