@@ -106,21 +106,22 @@ and leave the vault better organized than you found it.
 2. Do what the request asks — research, drafting, restructuring, reminders
    (cronjob tool), calendar events, file edits, anything you can do.
 3. Choose the output form and placement with YOUR OWN JUDGMENT:
-   - Short factual answer -> just answer; it will be placed inline.
+   - Short factual answer -> write it inline right where the mention is.
    - Substantial output (research, long drafts) -> create a NEW note (in
-     inbox/ unless context clearly says otherwise) and reference it with a
-     [[wikilink]] in your answer.
+     inbox/ unless context clearly says otherwise) and link it with a
+     [[wikilink]] from where the mention was.
    - Mention attached to a task (e.g. a todo line ending in "research") ->
-     do the work in a result note and answer with the [[wikilink]] plus a
-     one-line summary.
+     do the work in a result note and put the [[wikilink]] on the task line.
    - Match the vault's style and AGENTS.md conventions in anything you write.
-4. MECHANICS (differs from the old webhook lane): the watcher inserts your
-   entire stdout as a `> 🤖 blockquote` under the mention line and flips the
-   tag to /done itself. So: do NOT edit the mention note's mention line or
-   write your reply into it yourself — reply on stdout only, with no
-   preamble or meta commentary. Keep the stdout reply short when the real
-   output lives in another note. You MAY edit other parts of the mention
-   note when the request asks for it.
+4. MECHANICS: unlike claude/codex, YOU own the note. Write your result into
+   the vault yourself (inline reply below the mention, an edit, a new note —
+   whatever fits per rule 3). An inline reply should be a blockquote in the
+   established style: `> 🤖 **hermes** (YYYY-MM-DD HH:MM):` followed by
+   quoted lines. Then flip the mention's tag suffix from /ack to /done
+   yourself. You may also rewrite the mention fragment entirely (e.g.
+   replace it with a [[wikilink]] on a todo line) — the preferred,
+   human-like outcome; in that case no /done tag is needed. Either way:
+   after a successful run the note must contain no /ack-suffixed tag.
 5. If you CREATE a note and future mentions in it should continue THIS
    conversation, register it: in the JSON file {state_path}, copy this
    note's entry (key "{rel_path}") to a new key with the new note's
@@ -130,8 +131,9 @@ and leave the vault better organized than you found it.
      vault note — it retriggers the watcher. Use the /done form or a
      `code span`.
    - Never git commit the vault.
-7. A short Telegram summary is sent automatically from your reply's first
-   lines — no need to send anything yourself."""
+7. Your stdout is NOT inserted into the note — it is sent to the user's
+   Telegram as a notification. End with 1-3 lines: what you did and where
+   the result lives."""
 
 logging.basicConfig(
     level=logging.INFO,
@@ -354,8 +356,34 @@ def notify_telegram(ok: bool, path: Path, reply: str):
         log.warning("telegram ping failed: %s", e)
 
 
+def finalize_hermes_tag(path: Path, acked_line: str) -> None:
+    """Safety net: if the /ack tag from this run still sits in the note
+    (agent finished but forgot to flip or rewrite it), flip it to /done.
+    The agent owns the note content; we only guarantee no /ack is left."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return
+    lines = text.split("\n")
+    try:
+        idx = lines.index(acked_line)
+    except ValueError:
+        return  # agent rewrote/removed the line — nothing to do
+    lines[idx] = re.sub(r"@hermes/ack", "@hermes/done", lines[idx], count=1, flags=re.IGNORECASE)
+    try:
+        path.write_text("\n".join(lines), encoding="utf-8")
+        log.info("safety-net: flipped forgotten /ack to /done in %s", path)
+    except OSError as e:
+        log.error("finalize_hermes_tag: cannot write %s: %s", path, e)
+
+
 def dispatch_hermes(path: Path, acked_line: str, context: str, mention_id: str):
-    """Run hermes with per-note session continuity and write the reply back."""
+    """Run hermes with per-note session continuity.
+
+    The agent writes its own result into the vault (inline reply, edits,
+    new notes) and flips /ack itself — stdout is only the Telegram summary.
+    On failure the watcher writes the /err blockquote (agent may have died
+    before touching the note)."""
     rel = str(path.relative_to(VAULT))
     request_line = re.sub(r"@hermes/ack", "", acked_line, count=1, flags=re.IGNORECASE).strip()
     prompt = HERMES_PROMPT.format(
@@ -378,7 +406,10 @@ def dispatch_hermes(path: Path, acked_line: str, context: str, mention_id: str):
                     [HERMES_BIN, "sessions", "rename", final_sid, f"obsidian: {path.stem}"],
                     capture_output=True, timeout=30,
                 )
-    write_reply(path, "hermes", acked_line, ok, reply)
+    if ok:
+        finalize_hermes_tag(path, acked_line)
+    else:
+        write_reply(path, "hermes", acked_line, ok, reply)
     notify_telegram(ok, path, reply)
 
 
