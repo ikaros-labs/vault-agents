@@ -1,7 +1,5 @@
 # vault-agents
 
-> Formerly `obsidian-hermes` — renamed because it dispatches to any agent (`@hermes`, `@claude`, `@codex`), not just Hermes. Deployed artifact names (systemd unit, state dir, env file) keep the old names — see AGENTS.md.
-
 Tag AI agents inside any Obsidian note. Write `@hermes <request>` (or `@claude` / `@codex`) on any line, save, and within seconds the agent acknowledges it in-place, does the work, and replies inline in the note — turning your vault into a first-class communication channel with [Hermes Agent](https://github.com/NousResearch/hermes-agent), [Claude Code](https://code.claude.com), and [Codex CLI](https://github.com/openai/codex).
 
 `@hermes` mentions get **per-note continuous sessions**: every mention in a note is another turn in the same conversation, so the agent remembers earlier context. Sessions expire after a period of inactivity (default 72 h).
