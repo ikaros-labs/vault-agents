@@ -33,7 +33,7 @@ Requests are free-form: research, drafting, restructuring, reminders (the agent 
 
 ## Per-note sessions (hermes only)
 
-- Mapping lives in `~/.local/state/obsidian-hermes/sessions.json`:
+- Mapping lives in `~/.local/state/vault-agents/sessions.json`:
   `{"<note path>": {"hermes": {"session_id": "...", "last_used": <epoch>}}}`
 - First mention in a note starts a session; later mentions run with `--resume <id>`.
 - Lazy TTL expiry: a mention after `SESSION_TTL_HOURS` (default 72) of inactivity starts fresh.
@@ -55,16 +55,16 @@ Requests are free-form: research, drafting, restructuring, reminders (the agent 
 ### 1. Install the watcher
 
 ```bash
-uv venv ~/.hermes/venvs/obsidian-watcher
-uv pip install --python ~/.hermes/venvs/obsidian-watcher/bin/python watchdog
+uv venv ~/.hermes/venvs/vault-agents
+uv pip install --python ~/.hermes/venvs/vault-agents/bin/python watchdog
 
-cp watcher.py ~/.hermes/scripts/obsidian-mention-watcher.py
-cp example.env ~/.config/obsidian-hermes-watcher.env   # then edit: vault path (+ optional overrides)
-chmod 600 ~/.config/obsidian-hermes-watcher.env
-cp obsidian-hermes-watcher.service ~/.config/systemd/user/
+cp watcher.py ~/.hermes/scripts/vault-agents-watcher.py
+cp example.env ~/.config/vault-agents-watcher.env   # then edit: vault path (+ optional overrides)
+chmod 600 ~/.config/vault-agents-watcher.env
+cp vault-agents-watcher.service ~/.config/systemd/user/
 
 systemctl --user daemon-reload
-systemctl --user enable --now obsidian-hermes-watcher
+systemctl --user enable --now vault-agents-watcher
 ```
 
 ### 2. Configure (env file)
@@ -77,7 +77,7 @@ systemctl --user enable --now obsidian-hermes-watcher
 | `ANTHROPIC_API_KEY` | — | auth for `claude -p` |
 | `HERMES_TIMEOUT_SECONDS` | `1200` | per-run cap for hermes |
 | `CLI_TIMEOUT_SECONDS` | `600` | per-run cap for claude/codex |
-| `SESSION_STATE_PATH` | `~/.local/state/obsidian-hermes/sessions.json` | note→session map |
+| `SESSION_STATE_PATH` | `~/.local/state/vault-agents/sessions.json` | note→session map |
 | `SESSION_TTL_HOURS` | `72` | session inactivity expiry |
 | `TELEGRAM_CHAT_ID` | — | chat for summary pings via `hermes send` (empty = off) |
 
@@ -98,9 +98,9 @@ Drop `@hermes say hi` into a scratch note, save, and watch the tag flip to `/ack
 ## Troubleshooting
 
 ```bash
-systemctl --user status obsidian-hermes-watcher
-journalctl --user -u obsidian-hermes-watcher -n 50
-cat ~/.local/state/obsidian-hermes/sessions.json     # note → session map
+systemctl --user status vault-agents-watcher
+journalctl --user -u vault-agents-watcher -n 50
+cat ~/.local/state/vault-agents/sessions.json     # note → session map
 hermes sessions list                                  # look for "obsidian: <note>"
 ```
 

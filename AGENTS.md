@@ -2,7 +2,7 @@
 
 Watcher daemon that turns `@hermes` / `@claude` / `@codex` mentions in an Obsidian vault into agent runs with inline replies. Single-file Python (`watcher.py`), no build step.
 
-> Renamed from `obsidian-hermes` (2026-09) — it serves any agent, not just Hermes. Deployed artifact names (systemd unit `obsidian-hermes-watcher`, state dir `~/.local/state/obsidian-hermes/`, live script/env paths) are intentionally UNCHANGED to avoid a risky live migration.
+> Renamed from `obsidian-hermes` (2026-09) — it serves any agent, not just Hermes. All deployed artifacts (unit, script, venv, env file, state dir) migrated to the new names 2026-09-07.
 
 ## Layout
 
@@ -10,7 +10,7 @@ Watcher daemon that turns `@hermes` / `@claude` / `@codex` mentions in an Obsidi
 |---|---|
 | `watcher.py` | The whole watcher: inotify (Python watchdog), debounce, mention regex, ack/done tag flips, direct CLI dispatch (`hermes chat` / `claude -p` / `codex exec`) in worker threads, per-note hermes session store, Telegram ping via `hermes send` |
 | `deploy.sh` | Copies `watcher.py` to the live path + restarts the systemd user unit |
-| `obsidian-hermes-watcher.service` | systemd user unit template |
+| `vault-agents-watcher.service` | systemd user unit template |
 | `example.env` | Template for the env file (VAULT_PATH + optional overrides) |
 
 ## Hermes per-note sessions (v3, 2026-09-07)
@@ -18,7 +18,7 @@ Watcher daemon that turns `@hermes` / `@claude` / `@codex` mentions in an Obsidi
 `@hermes` runs `hermes chat -Q -q <prompt>` (first mention in a note) or
 `hermes chat -Q -q <prompt> --resume <session_id> --no-restore-cwd` (later
 mentions), cwd=vault. The note→session map lives at
-`~/.local/state/obsidian-hermes/sessions.json` (env `SESSION_STATE_PATH`),
+`~/.local/state/vault-agents/sessions.json` (env `SESSION_STATE_PATH`),
 schema `{rel_note_path: {agent: {session_id, last_used}}}` — nested per-agent
 so claude/codex resume can be added later without migration. Lazy TTL expiry
 (`SESSION_TTL_HOURS`, default 72) on read. Per-note `threading.Lock`
@@ -37,10 +37,10 @@ Telegram summary ping goes via `hermes send -t telegram:<TELEGRAM_CHAT_ID>`
 
 Edit **here**, then run `./deploy.sh`. Never edit the live copy directly.
 
-- Live script: `~/.hermes/scripts/obsidian-mention-watcher.py`
-- Venv: `~/.hermes/venvs/obsidian-watcher/` (watchdog; requests no longer needed)
-- Unit: `systemctl --user status obsidian-hermes-watcher` / `journalctl --user -u obsidian-hermes-watcher`
-- Secrets: `~/.config/obsidian-hermes-watcher.env` (deliberately OUTSIDE `~/.hermes`, which is a git-pushed backup repo)
+- Live script: `~/.hermes/scripts/vault-agents-watcher.py`
+- Venv: `~/.hermes/venvs/vault-agents/` (watchdog; requests no longer needed)
+- Unit: `systemctl --user status vault-agents-watcher` / `journalctl --user -u vault-agents-watcher`
+- Secrets: `~/.config/vault-agents-watcher.env` (deliberately OUTSIDE `~/.hermes`, which is a git-pushed backup repo)
 
 ## Behavior invariants (don't break these)
 
@@ -64,5 +64,5 @@ Edit **here**, then run `./deploy.sh`. Never edit the live copy directly.
 
 1. `./deploy.sh`
 2. Edit a vault note: flip an existing `/done` tag back to the bare tag, save.
-3. Watch `journalctl --user -u obsidian-hermes-watcher -f` for pickup/ack/dispatch.
+3. Watch `journalctl --user -u vault-agents-watcher -f` for pickup/ack/dispatch.
 4. For session continuity: mention with a fact in one save, ask for it back in a second mention, verify the reply and `sessions.json`.

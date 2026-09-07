@@ -26,7 +26,7 @@ Run as a systemd user service. Config via env vars (see unit file):
 Optional:
   CLAUDE_BIN, CODEX_BIN, HERMES_BIN (absolute paths; systemd PATH is bare)
   CLI_TIMEOUT_SECONDS (default 600), HERMES_TIMEOUT_SECONDS (default 1200)
-  SESSION_STATE_PATH (default ~/.local/state/obsidian-hermes/sessions.json)
+  SESSION_STATE_PATH (default ~/.local/state/vault-agents/sessions.json)
   SESSION_TTL_HOURS (default 72)
   TELEGRAM_CHAT_ID (default 233267520; empty string disables pings)
 """
@@ -54,7 +54,7 @@ CLI_TIMEOUT_SECONDS = int(os.environ.get("CLI_TIMEOUT_SECONDS", "600"))
 HERMES_TIMEOUT_SECONDS = int(os.environ.get("HERMES_TIMEOUT_SECONDS", "1200"))
 SESSION_STATE_PATH = Path(os.environ.get(
     "SESSION_STATE_PATH",
-    os.path.expanduser("~/.local/state/obsidian-hermes/sessions.json"),
+    os.path.expanduser("~/.local/state/vault-agents/sessions.json"),
 ))
 SESSION_TTL_HOURS = float(os.environ.get("SESSION_TTL_HOURS", "72"))
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "233267520")
@@ -140,7 +140,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
     stream=sys.stdout,
 )
-log = logging.getLogger("obsidian-watcher")
+log = logging.getLogger("vault-agents")
 
 # Trailing-line mentions waiting for the file to go quiet:
 #   path_str -> (full_text_sha1, first_seen_monotonic)

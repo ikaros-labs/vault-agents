@@ -1,0 +1,13 @@
+[Unit]
+Description=vault-agents mention watcher (@hermes/@claude/@codex in Obsidian notes)
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/vault-agents-watcher.env
+ExecStart=%h/.hermes/venvs/vault-agents/bin/python %h/.hermes/scripts/vault-agents-watcher.py
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
