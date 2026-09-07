@@ -46,7 +46,7 @@ Edit **here**, then run `./deploy.sh`. Never edit the live copy directly.
 - Regex matches bare `@<agent>` word-boundary only — not `/ack|/done|/err` suffixed, not `-` suffixed (npm scoped packages), not inside fenced code blocks or `inline code` spans (masked before matching).
 - Ack is written in-file FIRST, then dispatch. Sync-collision guard: file is re-read just before the ack write; abort + reschedule if changed.
 - Lifecycle: bare tag → `/ack` → `/done` (or `/err`; retry = edit back to the bare tag).
-- The WATCHER writes the reply blockquote for all three agents (hermes included, since v3 — the agent is told NOT to edit the mention note itself).
+- Reply writing: the WATCHER writes the blockquote for claude/codex and for hermes FAILURES (`/err`); on success the hermes agent writes its own result into the vault and flips /ack itself (v3.1) — watcher only safety-net-flips a forgotten /ack to /done. Hermes stdout = Telegram summary only.
 - Ignores dot-dirs, `.git`, `.obsidian`, `.trash`, `templates/`.
 - Initial scan on startup dispatches immediately (catches mentions written while down).
 
