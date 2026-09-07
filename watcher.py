@@ -4,11 +4,15 @@
 Watches the Obsidian vault for edits to *.md files. When a line contains a
 bare agent mention (@hermes, @claude, @codex — not .../ack, /done, /err), it:
   1. rewrites the tag -> @<agent>/ack in the note (dedup + visual receipt)
-  2. dispatches the request:
-       - hermes: POST to the Hermes webhook endpoint (V2 HMAC). Hermes runs
-         the agent, writes the inline reply, flips /done, pings Telegram.
-       - claude / codex: runs the CLI directly as a subprocess; the WATCHER
-         writes the reply blockquote and flips /ack -> /done (or /err).
+  2. dispatches the request by running the agent CLI as a subprocess in a
+     worker thread; the WATCHER writes the reply blockquote and flips
+     /ack -> /done (or /err).
+
+hermes gets PER-NOTE CONTINUOUS SESSIONS: the first mention in a note starts
+a session (`hermes chat -Q -q`), later mentions resume it (`--resume <id>`),
+so conversation context persists within a note. Mapping note -> session_id
+lives in SESSION_STATE_PATH with lazy TTL expiry. claude/codex stay
+stateless (one-shot per mention).
 
 Dispatch rules ("Enter = send"):
   - A mention followed by ANY further line (even blank / trailing newline)
@@ -18,15 +22,17 @@ Dispatch rules ("Enter = send"):
     for STABILITY_SECONDS, then dispatched.
 
 Run as a systemd user service. Config via env vars (see unit file):
-  VAULT_PATH, WEBHOOK_URL, WEBHOOK_SECRET
+  VAULT_PATH
 Optional:
-  CLAUDE_BIN, CODEX_BIN (absolute paths; systemd PATH lacks ~/.npm-global/bin)
-  CLI_TIMEOUT_SECONDS (default 600)
+  CLAUDE_BIN, CODEX_BIN, HERMES_BIN (absolute paths; systemd PATH is bare)
+  CLI_TIMEOUT_SECONDS (default 600), HERMES_TIMEOUT_SECONDS (default 1200)
+  SESSION_STATE_PATH (default ~/.local/state/obsidian-hermes/sessions.json)
+  SESSION_TTL_HOURS (default 72)
+  TELEGRAM_CHAT_ID (default 233267520; empty string disables pings)
 """
 
 import datetime
 import hashlib
-import hmac
 import json
 import logging
 import os
@@ -37,16 +43,21 @@ import threading
 import time
 from pathlib import Path
 
-import requests
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
 VAULT = Path(os.environ.get("VAULT_PATH", os.path.expanduser("~/obsidian-vault")))
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "http://localhost:8644/webhooks/obsidian-mention")
-SECRET = os.environ.get("WEBHOOK_SECRET", "")
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", os.path.expanduser("~/.npm-global/bin/claude"))
 CODEX_BIN = os.environ.get("CODEX_BIN", os.path.expanduser("~/.npm-global/bin/codex"))
+HERMES_BIN = os.environ.get("HERMES_BIN", os.path.expanduser("~/.local/bin/hermes"))
 CLI_TIMEOUT_SECONDS = int(os.environ.get("CLI_TIMEOUT_SECONDS", "600"))
+HERMES_TIMEOUT_SECONDS = int(os.environ.get("HERMES_TIMEOUT_SECONDS", "1200"))
+SESSION_STATE_PATH = Path(os.environ.get(
+    "SESSION_STATE_PATH",
+    os.path.expanduser("~/.local/state/obsidian-hermes/sessions.json"),
+))
+SESSION_TTL_HOURS = float(os.environ.get("SESSION_TTL_HOURS", "72"))
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "233267520")
 DEBOUNCE_SECONDS = 3.0
 STABILITY_SECONDS = 8.0  # quiet time required for a trailing-line mention
 CONTEXT_LINES = 20
@@ -73,6 +84,32 @@ stdout reply will be inserted into the note as a quoted reply, so respond
 with ONLY the answer text (markdown ok, no preamble, no meta commentary).
 Be concise unless the task demands length. Do not edit any files in the
 vault yourself unless the request explicitly asks you to modify a file."""
+
+HERMES_PROMPT = """You are answering a mention inside the user's Obsidian note.
+This conversation is the PERSISTENT session for this note — earlier mentions
+in the same note are earlier turns in this conversation.
+Note file: {note_path}
+The request line: {mention_line}
+
+Surrounding note context:
+---
+{context}
+---
+
+Answer the request on the mention line, using the note context and this
+conversation's history. Your entire final reply will be inserted into the
+note as a quoted blockquote by the watcher, so respond with ONLY the answer
+text (markdown ok, no preamble, no meta commentary). Do NOT edit the
+mention note to add your reply yourself. Be concise unless the task demands
+length.
+
+You may create or edit vault files when the request explicitly asks for it.
+If you CREATE a new note and future mentions in it should continue THIS
+conversation, register it: read the JSON file {state_path}, and copy this
+note's entry (key "{rel_path}") to a new key holding the new note's
+vault-relative path (keep all other keys intact, write the file back).
+If you refer to the mention tag itself in any note, write it as
+@hermes/done — NEVER the bare tag (it would re-trigger the watcher)."""
 
 logging.basicConfig(
     level=logging.INFO,
@@ -124,25 +161,74 @@ def find_mentions(lines):
             yield i, line, m.group(1).lower()
 
 
-def post_webhook(payload: dict) -> bool:
-    body = json.dumps(payload).encode()
-    ts = str(int(time.time()))
-    sig = hmac.new(SECRET.encode(), ts.encode() + b"." + body, hashlib.sha256).hexdigest()
-    headers = {
-        "Content-Type": "application/json",
-        "X-Webhook-Timestamp": ts,
-        "X-Webhook-Signature-V2": sig,
-    }
-    for attempt in range(3):
+# ------------------------------------------------------- hermes session store
+#
+# SESSION_STATE_PATH maps vault-relative note path -> per-agent session info:
+#   {"inbox/note.md": {"hermes": {"session_id": "...", "last_used": 1757250000}}}
+# Only "hermes" is populated today; schema is nested per-agent so claude/codex
+# resume can be added without migration. Re-read from disk on every access so
+# entries appended externally (e.g. by the agent registering a spin-off note)
+# are honored. Lazy TTL expiry on read.
+
+_state_lock = threading.Lock()
+
+
+def _load_sessions() -> dict:
+    try:
+        return json.loads(SESSION_STATE_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, json.JSONDecodeError) as e:
+        log.warning("session state unreadable (%s) — backing up and starting fresh", e)
         try:
-            r = requests.post(WEBHOOK_URL, data=body, headers=headers, timeout=15)
-            if r.status_code < 300:
-                return True
-            log.warning("webhook POST %s -> %s: %s", payload.get("mention_id"), r.status_code, r.text[:200])
-        except requests.RequestException as e:
-            log.warning("webhook POST failed (attempt %d): %s", attempt + 1, e)
-        time.sleep(2 * (attempt + 1))
-    return False
+            SESSION_STATE_PATH.replace(SESSION_STATE_PATH.with_suffix(".json.corrupt"))
+        except OSError:
+            pass
+        return {}
+
+
+def _save_sessions(state: dict):
+    SESSION_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = SESSION_STATE_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(state, indent=1), encoding="utf-8")
+    os.replace(tmp, SESSION_STATE_PATH)
+
+
+def get_session_id(rel_path: str, agent: str = "hermes"):
+    """Return a live session_id for the note, or None (missing/expired)."""
+    with _state_lock:
+        state = _load_sessions()
+        entry = state.get(rel_path, {}).get(agent)
+        if not entry:
+            return None
+        if time.time() - entry.get("last_used", 0) > SESSION_TTL_HOURS * 3600:
+            log.info("session for %s expired (> %.0fh) — starting fresh", rel_path, SESSION_TTL_HOURS)
+            del state[rel_path][agent]
+            if not state[rel_path]:
+                del state[rel_path]
+            _save_sessions(state)
+            return None
+        return entry.get("session_id")
+
+
+def set_session(rel_path: str, session_id: str, agent: str = "hermes"):
+    with _state_lock:
+        state = _load_sessions()
+        state.setdefault(rel_path, {})[agent] = {
+            "session_id": session_id,
+            "last_used": time.time(),
+        }
+        _save_sessions(state)
+
+
+# Per-note locks: a resumed session must not run two turns concurrently.
+_note_locks: dict = {}
+_note_locks_guard = threading.Lock()
+
+
+def _note_lock(rel_path: str) -> threading.Lock:
+    with _note_locks_guard:
+        return _note_locks.setdefault(rel_path, threading.Lock())
 
 
 # ---------------------------------------------------------------- CLI agents
@@ -194,6 +280,84 @@ def run_codex(prompt: str):
 
 
 CLI_RUNNERS = {"claude": run_claude, "codex": run_codex}
+
+HERMES_SESSION_LINE = re.compile(r"^session_id:\s*(\S+)\s*$", re.MULTILINE)
+HERMES_NOISE = re.compile(r"^(↻ Resumed session\b|session_id:\s)")
+HERMES_STALE_SESSION = re.compile(r"(session .* not found|no session|could not resume)", re.IGNORECASE)
+
+
+def run_hermes(prompt: str, resume_id=None):
+    """Run one hermes turn. Returns (ok, reply_text, session_id_or_None).
+
+    NOTE: `hermes -z` silently ignores --resume/--continue (verified
+    2026-09-07) — must be `hermes chat -Q -q`.
+    """
+    cmd = [HERMES_BIN, "chat", "-Q", "-q", prompt]
+    if resume_id:
+        cmd += ["--resume", resume_id, "--no-restore-cwd"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
+                           timeout=HERMES_TIMEOUT_SECONDS, cwd=str(VAULT))
+    except subprocess.TimeoutExpired:
+        return False, f"timed out after {HERMES_TIMEOUT_SECONDS}s", None
+    out = r.stdout or ""
+    err = r.stderr or ""
+    # `session_id:` and the resume banner are printed to STDERR by -Q
+    # (stdout carries only the reply text). Verified 2026-09-07.
+    m = HERMES_SESSION_LINE.search(err) or HERMES_SESSION_LINE.search(out)
+    sid = m.group(1) if m else None
+    if r.returncode != 0:
+        err_msg = (err or out or "unknown error").strip()
+        if resume_id and HERMES_STALE_SESSION.search(err_msg):
+            log.warning("stale session %s — retrying with a fresh session", resume_id)
+            return run_hermes(prompt, resume_id=None)
+        return False, err_msg[-500:], sid
+    reply = "\n".join(ln for ln in out.split("\n") if not HERMES_NOISE.match(ln)).strip()
+    return (bool(reply), reply or "empty hermes output", sid)
+
+
+def notify_telegram(ok: bool, path: Path, reply: str):
+    """Fire-and-forget Telegram ping via `hermes send` (no LLM involved)."""
+    if not TELEGRAM_CHAT_ID:
+        return
+    status = "✅" if ok else "⚠️"
+    summary = " ".join(reply.split())[:200]
+    msg = f"{status} obsidian · {path.stem}\n{summary}"
+    try:
+        subprocess.run(
+            [HERMES_BIN, "send", "-q", "-t", f"telegram:{TELEGRAM_CHAT_ID}", msg],
+            capture_output=True, timeout=30,
+        )
+    except (subprocess.TimeoutExpired, OSError) as e:
+        log.warning("telegram ping failed: %s", e)
+
+
+def dispatch_hermes(path: Path, acked_line: str, context: str, mention_id: str):
+    """Run hermes with per-note session continuity and write the reply back."""
+    rel = str(path.relative_to(VAULT))
+    request_line = re.sub(r"@hermes/ack", "", acked_line, count=1, flags=re.IGNORECASE).strip()
+    prompt = HERMES_PROMPT.format(
+        note_path=str(path), mention_line=request_line, context=context,
+        state_path=str(SESSION_STATE_PATH), rel_path=rel,
+    )
+    with _note_lock(rel):
+        sid = get_session_id(rel)
+        log.info("[hermes] %s running for %s (session=%s)", mention_id, rel, sid or "new")
+        t0 = time.monotonic()
+        ok, reply, out_sid = run_hermes(prompt, resume_id=sid)
+        log.info("[hermes] %s finished ok=%s in %.0fs (session=%s)",
+                 mention_id, ok, time.monotonic() - t0, out_sid or sid)
+        final_sid = out_sid or sid
+        if final_sid:
+            fresh = final_sid != sid
+            set_session(rel, final_sid)  # upsert also refreshes last_used
+            if fresh:
+                subprocess.run(
+                    [HERMES_BIN, "sessions", "rename", final_sid, f"obsidian: {path.stem}"],
+                    capture_output=True, timeout=30,
+                )
+    write_reply(path, "hermes", acked_line, ok, reply)
+    notify_telegram(ok, path, reply)
 
 
 def _now_stamp() -> str:
@@ -362,26 +526,12 @@ def process_file(path: Path, assume_finished: bool = False):
     for ev in events:
         agent = ev["agent"]
         log.info("mention %s (@%s) in %s (line %d)", ev["mention_id"], agent, path, ev["line_number"])
-        if agent == "hermes":
-            payload = {
-                "event_type": "obsidian_mention",
-                "mention_id": ev["mention_id"],
-                "note_path": path_str,
-                "line_number": ev["line_number"],
-                "mention_line": ev["acked_line"],
-                "context": ev["context"],
-            }
-            if post_webhook(payload):
-                log.info("dispatched %s", ev["mention_id"])
-            else:
-                log.error("FAILED to dispatch %s — mention is acked but not delivered", ev["mention_id"])
-        else:
-            worker = threading.Thread(
-                target=dispatch_cli,
-                args=(agent, path, ev["acked_line"], ev["context"], ev["mention_id"]),
-                daemon=True,
-            )
-            worker.start()
+        target = dispatch_hermes if agent == "hermes" else dispatch_cli
+        args = ((path, ev["acked_line"], ev["context"], ev["mention_id"])
+                if agent == "hermes"
+                else (agent, path, ev["acked_line"], ev["context"], ev["mention_id"]))
+        worker = threading.Thread(target=target, args=args, daemon=True)
+        worker.start()
 
 
 class Handler(FileSystemEventHandler):
@@ -440,14 +590,16 @@ def initial_scan():
 
 
 def main():
-    if not SECRET:
-        log.error("WEBHOOK_SECRET not set")
-        sys.exit(1)
     if not VAULT.is_dir():
         log.error("vault not found: %s", VAULT)
         sys.exit(1)
-    log.info("watching %s (agents: %s; debounce %.0fs, trailing-line stability %.0fs)",
-             VAULT, ", ".join(AGENTS), DEBOUNCE_SECONDS, STABILITY_SECONDS)
+    if not os.access(HERMES_BIN, os.X_OK):
+        log.error("hermes binary not found/executable: %s", HERMES_BIN)
+        sys.exit(1)
+    log.info("watching %s (agents: %s; debounce %.0fs, trailing-line stability %.0fs; "
+             "hermes sessions: %s, ttl %.0fh)",
+             VAULT, ", ".join(AGENTS), DEBOUNCE_SECONDS, STABILITY_SECONDS,
+             SESSION_STATE_PATH, SESSION_TTL_HOURS)
     initial_scan()
     observer = Observer()
     observer.schedule(Handler(), str(VAULT), recursive=True)
