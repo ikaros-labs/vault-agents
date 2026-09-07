@@ -1,6 +1,8 @@
-# obsidian-hermes — agent guide
+# vault-agents — agent guide
 
 Watcher daemon that turns `@hermes` / `@claude` / `@codex` mentions in an Obsidian vault into agent runs with inline replies. Single-file Python (`watcher.py`), no build step.
+
+> Renamed from `obsidian-hermes` (2026-09) — it serves any agent, not just Hermes. Deployed artifact names (systemd unit `obsidian-hermes-watcher`, state dir `~/.local/state/obsidian-hermes/`, live script/env paths) are intentionally UNCHANGED to avoid a risky live migration.
 
 ## Layout
 
