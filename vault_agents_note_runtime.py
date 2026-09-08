@@ -7,6 +7,8 @@ import threading
 
 log = logging.getLogger('vault-agents')
 MENTION_RE = re.compile(r'(?<![\w/])@(hermes|claude|codex)(?![-/\w])', re.I)
+# Process-lifetime registry: one lock per encountered note/session. Keeping locks
+# avoids replacing one while another thread still holds or waits for it.
 _LOCKS = {}
 _LOCKS_GUARD = threading.Lock()
 

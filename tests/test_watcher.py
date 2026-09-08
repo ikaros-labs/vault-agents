@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import patch
 
 import watcher as w
-from note_runtime import Request, Scheduler, find_mentions, update_note
+from vault_agents_note_runtime import Request, Scheduler, find_mentions, update_note
 
 
 class WatcherTests(unittest.TestCase):
@@ -51,6 +51,45 @@ class WatcherTests(unittest.TestCase):
         self.assertIn('@codex/done', result)
         self.assertIn('claude answer', result)
         self.assertIn('codex answer', result)
+
+    def test_prompt_excerpts_are_safe_to_echo(self):
+        self.path.write_text('@hermes first @claude second\n@codex still typing')
+        captured = []
+        class Worker:
+            def __init__(self, target, args, daemon): captured.append(args[1])
+            def start(self): pass
+        with patch.object(w.threading, 'Thread', Worker):
+            w.process_file(self.path)
+        self.assertEqual([r.agent for r in captured], ['hermes', 'claude'])
+        for request in captured:
+            self.assertFalse(w.MENTION_RE.search(request.line))
+            self.assertFalse(w.MENTION_RE.search(request.context))
+            self.assertNotIn('vault-agent:', request.context)
+            self.assertIn('@codex/done still typing', request.context)
+        self.assertEqual(captured[0].line, 'first @claude/done second')
+        self.assertIn('@codex still typing', self.path.read_text())
+
+    def test_completion_removes_only_its_own_marker(self):
+        for agent in ['hermes', 'claude', 'codex']:
+            for ok in [True, False]:
+                with self.subTest(agent=agent, ok=ok):
+                    request = self.request(agent)
+                    other = self.request('hermes', 'other')
+                    self.path.write_text(f'@{agent}/ack {request.marker} task @hermes/ack {other.marker} next\n')
+                    w.complete_request(self.path, request, ok, f'answer {request.marker}')
+                    result = self.path.read_text()
+                    self.assertNotIn(request.marker, result)
+                    self.assertIn(other.marker, result)
+                    self.assertIn(f"@{agent}/{'done' if ok else 'err'} task", result)
+
+    def test_hermes_rewrite_and_already_done_remove_marker(self):
+        request = self.request('hermes')
+        for text, expected in [(f'[[result]] {request.marker}\n', '[[result]]\n'),
+                               (f'@hermes/done {request.marker} task\n', '@hermes/done task\n')]:
+            with self.subTest(text=text):
+                self.path.write_text(text)
+                w.complete_request(self.path, request, True, 'finished')
+                self.assertEqual(self.path.read_text(), expected)
 
     def test_concurrent_replies_are_preserved(self):
         requests = [self.request('claude', 'one'), self.request('codex', 'two')]
@@ -188,7 +227,7 @@ class WatcherTests(unittest.TestCase):
         scheduler = Scheduler(fired.append)
         self.addCleanup(scheduler.close)
         self.path.write_text('note')
-        with patch('note_runtime.threading.Timer'):
+        with patch('vault_agents_note_runtime.threading.Timer'):
             scheduler.schedule(self.path, 3)
             old = scheduler.entries[str(self.path)][0]
             scheduler.schedule(self.path, 8)

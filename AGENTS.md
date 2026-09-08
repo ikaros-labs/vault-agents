@@ -1,6 +1,6 @@
 # vault-agents — agent guide
 
-Watcher daemon that turns `@hermes` / `@claude` / `@codex` mentions in an Obsidian vault into agent runs with inline replies. Python entrypoint (`watcher.py`) plus `note_runtime.py`, no build step.
+Watcher daemon that turns `@hermes` / `@claude` / `@codex` mentions in an Obsidian vault into agent runs with inline replies. Python entrypoint (`watcher.py`) plus `vault_agents_note_runtime.py`, no build step.
 
 > Renamed from `obsidian-hermes` (2026-09) — it serves any agent, not just Hermes. All deployed artifacts (unit, script, venv, env file, state dir) migrated to the new names 2026-09-07.
 
@@ -9,7 +9,7 @@ Watcher daemon that turns `@hermes` / `@claude` / `@codex` mentions in an Obsidi
 | File | Purpose |
 |---|---|
 | `watcher.py` | Watcher orchestration: inotify (Python watchdog), debounce, mention regex, ack/done tag flips, direct CLI dispatch (`hermes chat` / `claude -p` / `codex exec`) in worker threads, per-note hermes session store, Telegram ping via `hermes send` |
-| `note_runtime.py` | Markdown parsing, request identity, serialized note updates, and per-path scheduling |
+| `vault_agents_note_runtime.py` | Markdown parsing, request identity, serialized note updates, and per-path scheduling |
 | `tests/test_watcher.py` | Regression tests using temporary notes and mocked subprocesses |
 | `deploy.sh` | Copies both Python modules to the live path + restarts the systemd user unit |
 | `vault-agents-watcher.service` | systemd user unit template |

@@ -59,7 +59,7 @@ Requests are free-form: research, drafting, restructuring, reminders (the agent 
 uv venv ~/.hermes/venvs/vault-agents
 uv pip install --python ~/.hermes/venvs/vault-agents/bin/python watchdog
 
-cp note_runtime.py ~/.hermes/scripts/note_runtime.py
+cp vault_agents_note_runtime.py ~/.hermes/scripts/vault_agents_note_runtime.py
 cp watcher.py ~/.hermes/scripts/vault-agents-watcher.py
 cp example.env ~/.config/vault-agents-watcher.env   # then edit: vault path (+ optional overrides)
 chmod 600 ~/.config/vault-agents-watcher.env
@@ -92,7 +92,7 @@ Drop `@hermes say hi` into a scratch note, save, and watch the tag flip to `/ack
 - Watches `**/*.md` under the vault; ignores dot-directories (`.git`, `.obsidian`, `.trash`) and `templates/`
 - 3-second debounce after the last write, so it doesn't fire mid-typing on editor autosave; a mention on the file's very last line (no newline after it) is held until the file is quiet for ~8 s ("Enter = send")
 - Mentions inside fenced code blocks and `inline code` are ignored — that's how you write the literal tag in docs without triggering it
-- The ack rewrite happens **before** dispatch. Watcher pickup and writes are serialized per note. Each request has an adjacent hidden HTML marker so edits and multiple mentions on one line do not break reply placement.
+- The ack rewrite happens **before** dispatch. Watcher pickup and writes are serialized per note. Each in-flight request has an adjacent HTML marker so edits and multiple mentions on one line do not break reply placement. The watcher removes that marker on completion, including failures and Hermes rewrites. Prompt excerpts remove the current request tag and suffix other bare mentions so they are safe to quote.
 - External editor/sync conflicts are detected by re-reading before writing; this is best-effort, not a filesystem compare-and-swap. Completion conflicts retry without rerunning the agent. Pending results are in memory: a daemon restart still requires manually retrying stranded `/ack` tags.
 - On startup the watcher scans the whole vault for pending bare mentions (catches anything written while it was down)
 - Works with Obsidian Sync / mobile: the watcher fires when sync lands the file on the host

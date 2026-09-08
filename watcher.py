@@ -43,7 +43,7 @@ import time
 import uuid
 from pathlib import Path
 
-from note_runtime import Request, Scheduler, find_mentions, keyed_lock, update_note
+from vault_agents_note_runtime import MENTION_RE, Request, Scheduler, find_mentions, keyed_lock, update_note
 
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
@@ -117,7 +117,8 @@ and leave the vault better organized than you found it.
    yourself. You may also rewrite the mention fragment entirely (e.g.
    replace it with a [[wikilink]] on a todo line) — the preferred,
    human-like outcome; in that case no /done tag is needed. Either way:
-   preserve the request marker {marker}; change only THIS request tag.
+   preserve the request marker {marker} until the watcher removes it at
+   completion; change only THIS request tag.
    Other pending requests must remain untouched.
 5. If you CREATE notes that should inherit this conversation, emit one stdout
    line: VAULT_INHERIT: ["inbox/new-note.md"] (a JSON array of relative paths).
@@ -139,6 +140,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("vault-agents")
 
+# Pending trailing notes retain a text snapshot until their next scan clears it.
 _pending = {}
 _completions = {}
 
@@ -376,25 +378,30 @@ def _now_stamp() -> str:
 
 def complete_request(path: Path, request: Request, ok: bool, reply: str):
     status = "done" if ok else "err"
-    pattern = re.compile(rf"@{request.agent}/(?:ack|done|err)([ \t]*{re.escape(request.marker)})", re.I)
+    marker = re.compile(rf"[ \t]*{re.escape(request.marker)}")
+    pattern = re.compile(rf"@{request.agent}/(?:ack|done|err){marker.pattern}", re.I)
+    body = reply if ok else f"agent run failed: {reply}"
+    quoted = "\n".join(f"> {line}" if line.strip() else ">" for line in body.splitlines())
+    block = f"> {'🤖' if ok else '⚠️'} **{request.agent}** ({_now_stamp()}):\n{quoted}\n"
+
     def transform(text):
         match = pattern.search(text)
         if not match:
             # Hermes may replace its request with a link. Never guess another tag.
             if request.agent == "hermes" and ok:
-                return text
+                return marker.sub("", text)
             # Preserve results even if a user deleted the request anchor.
-            return text + f"\n\n> Request {request.mention_id} (original marker removed)\n" + block
-        updated = text[:match.start()] + f"@{request.agent}/{status}" + match[1] + text[match.end():]
-        if request.agent == "hermes" and ok:
-            return updated
-        end = updated.find("\n", match.start())
-        if end < 0:
-            end = len(updated)
-        return updated[:end] + "\n" + block + updated[end:]
-    body = reply if ok else f"agent run failed: {reply}"
-    quoted = "\n".join(f"> {line}" if line.strip() else ">" for line in body.splitlines())
-    block = f"> {'🤖' if ok else '⚠️'} **{request.agent}** ({_now_stamp()}):\n{quoted}\n"
+            updated = text + f"\n\n> Request {request.mention_id} (original marker removed)\n" + block
+        else:
+            updated = text[:match.start()] + f"@{request.agent}/{status}" + text[match.end():]
+            if request.agent != "hermes" or not ok:
+                end = updated.find("\n", match.start())
+                if end < 0:
+                    end = len(updated)
+                updated = updated[:end] + "\n" + block + updated[end:]
+        # Also remove copies in an echoed reply or a rewritten Hermes fragment.
+        return marker.sub("", updated)
+
     return update_note(path, transform)
 
 
@@ -443,6 +450,11 @@ def process_file(path: Path, assume_finished: bool = False):
             log.exception("cannot process %s", path)
 
 
+def quote_safe_mentions(text: str) -> str:
+    """Prompt excerpts must not plant new requests when quoted into a note."""
+    return MENTION_RE.sub(lambda match: f"@{match[1]}/done", text)
+
+
 def _process_file(path: Path, assume_finished: bool):
     text = path.read_text(encoding="utf-8")
     lines = text.split("\n")
@@ -458,10 +470,16 @@ def _process_file(path: Path, assume_finished: bool):
     ready = [(idx, match) for idx, match in hits
              if assume_finished or idx < len(lines) - 1 or now - since >= STABILITY_SECONDS]
     requests = []
+    prompt_lines = lines.copy()
     for idx, match in reversed(ready):
         agent = match[1].lower()
-        request = Request(agent, uuid.uuid4().hex, lines[idx],
-                          "\n".join(lines[max(0, idx-CONTEXT_LINES):idx+CONTEXT_LINES+1]))
+        # Remove this request's tag; make other bare tags safe to quote, including
+        # trailing requests that have not been acknowledged yet. Use an immutable
+        # snapshot so another request's in-flight marker never enters the prompt.
+        line = prompt_lines[idx][:match.start()] + prompt_lines[idx][match.end():]
+        context = "\n".join(prompt_lines[max(0, idx-CONTEXT_LINES):idx+CONTEXT_LINES+1])
+        request = Request(agent, uuid.uuid4().hex, quote_safe_mentions(line).strip(),
+                          quote_safe_mentions(context))
         lines[idx] = (lines[idx][:match.start()] + f"@{agent}/ack {request.marker}"
                       + lines[idx][match.end():])
         requests.append(request)
