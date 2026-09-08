@@ -117,8 +117,7 @@ and leave the vault better organized than you found it.
    yourself. You may also rewrite the mention fragment entirely (e.g.
    replace it with a [[wikilink]] on a todo line) — the preferred,
    human-like outcome; in that case no /done tag is needed. Either way:
-   preserve the request marker {marker} until the watcher removes it at
-   completion; change only THIS request tag.
+   change only THIS request's tag (the /ack on the request line above).
    Other pending requests must remain untouched.
 5. If you CREATE notes that should inherit this conversation, emit one stdout
    line: VAULT_INHERIT: ["inbox/new-note.md"] (a JSON array of relative paths).
@@ -317,7 +316,6 @@ def run_hermes_request(path: Path, request: Request):
     rel = str(path.relative_to(VAULT))
     prompt = HERMES_PROMPT.format(
         note_path=str(path), mention_line=request.line, context=request.context,
-        marker=request.marker,
     )
     # Hermes edits the note itself: hold the watcher write lock for its turn.
     # A shared session lock also covers inherited notes with different paths.
@@ -378,29 +376,38 @@ def _now_stamp() -> str:
 
 def complete_request(path: Path, request: Request, ok: bool, reply: str):
     status = "done" if ok else "err"
-    marker = re.compile(rf"[ \t]*{re.escape(request.marker)}")
-    pattern = re.compile(rf"@{request.agent}/(?:ack|done|err){marker.pattern}", re.I)
+    ack_re = re.compile(rf"(?<![\w/])@{request.agent}/ack(?![-/\w])", re.I)
     body = reply if ok else f"agent run failed: {reply}"
     quoted = "\n".join(f"> {line}" if line.strip() else ">" for line in body.splitlines())
-    block = f"> {'🤖' if ok else '⚠️'} **{request.agent}** ({_now_stamp()}):\n{quoted}\n"
+    block = f"> {'🤖' if ok else '⚠️'} **{request.agent}** ({_now_stamp()}):\n{quoted}"
 
     def transform(text):
-        match = pattern.search(text)
-        if not match:
+        lines = text.split("\n")
+        # Primary anchor: the exact line as written at ack time + which /ack
+        # occurrence on it is ours (survives multiple mentions per line).
+        anchor = None
+        if request.acked_line in lines:
+            idx = lines.index(request.acked_line)
+            matches = list(ack_re.finditer(lines[idx]))
+            if len(matches) > request.ordinal:
+                anchor = (idx, matches[request.ordinal])
+        if anchor is None:
+            # Line edited mid-run: fall back to the first remaining /ack tag
+            # for this agent anywhere in the note. Ambiguous only if several
+            # same-agent requests are in flight AND their lines were edited.
+            anchor = next(((i, m) for i, line in enumerate(lines)
+                           for m in [ack_re.search(line)] if m), None)
+        if anchor is None:
             # Hermes may replace its request with a link. Never guess another tag.
             if request.agent == "hermes" and ok:
-                return marker.sub("", text)
+                return text
             # Preserve results even if a user deleted the request anchor.
-            updated = text + f"\n\n> Request {request.mention_id} (original marker removed)\n" + block
-        else:
-            updated = text[:match.start()] + f"@{request.agent}/{status}" + text[match.end():]
-            if request.agent != "hermes" or not ok:
-                end = updated.find("\n", match.start())
-                if end < 0:
-                    end = len(updated)
-                updated = updated[:end] + "\n" + block + updated[end:]
-        # Also remove copies in an echoed reply or a rewritten Hermes fragment.
-        return marker.sub("", updated)
+            return text + f"\n\n> Request {request.mention_id} (original request tag removed)\n" + block + "\n"
+        idx, match = anchor
+        lines[idx] = lines[idx][:match.start()] + f"@{request.agent}/{status}" + lines[idx][match.end():]
+        if request.agent != "hermes" or not ok:
+            lines.insert(idx + 1, block)
+        return "\n".join(lines)
 
     return update_note(path, transform)
 
@@ -469,20 +476,30 @@ def _process_file(path: Path, assume_finished: bool):
     _pending[str(path)] = (text, since)
     ready = [(idx, match) for idx, match in hits
              if assume_finished or idx < len(lines) - 1 or now - since >= STABILITY_SECONDS]
-    requests = []
     prompt_lines = lines.copy()
+    by_line = {}
+    for idx, match in ready:
+        by_line.setdefault(idx, []).append(match)
+    pending = []
     for idx, match in reversed(ready):
         agent = match[1].lower()
         # Remove this request's tag; make other bare tags safe to quote, including
         # trailing requests that have not been acknowledged yet. Use an immutable
-        # snapshot so another request's in-flight marker never enters the prompt.
+        # snapshot so another request's ack never enters the prompt.
         line = prompt_lines[idx][:match.start()] + prompt_lines[idx][match.end():]
         context = "\n".join(prompt_lines[max(0, idx-CONTEXT_LINES):idx+CONTEXT_LINES+1])
-        request = Request(agent, uuid.uuid4().hex, quote_safe_mentions(line).strip(),
-                          quote_safe_mentions(context))
-        lines[idx] = (lines[idx][:match.start()] + f"@{agent}/ack {request.marker}"
-                      + lines[idx][match.end():])
-        requests.append(request)
+        lines[idx] = lines[idx][:match.start()] + f"@{agent}/ack" + lines[idx][match.end():]
+        # Every ack rewrite inserts exactly "/ack" (4 chars); acks to our right
+        # don't shift us, earlier ones on this line shift us right by 4 each.
+        final_start = match.start() + 4 * sum(1 for m in by_line[idx] if m.start() < match.start())
+        pending.append((idx, agent, final_start,
+                        quote_safe_mentions(line).strip(), quote_safe_mentions(context)))
+    requests = []
+    for idx, agent, final_start, line, context in pending:
+        acked = lines[idx]
+        ack_re = re.compile(rf"(?<![\w/])@{agent}/ack(?![-/\w])", re.I)
+        ordinal = sum(1 for m in ack_re.finditer(acked) if m.start() < final_start)
+        requests.append(Request(agent, uuid.uuid4().hex, line, context, acked, ordinal))
     if ready:
         if not update_note(path, lambda current: "\n".join(lines) if current == text else None):
             scheduler.schedule(path, DEBOUNCE_SECONDS)
