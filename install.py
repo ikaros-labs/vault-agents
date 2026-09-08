@@ -33,7 +33,6 @@ def main():
     if not shutil.which('systemctl'):
         parser.error('systemctl is required (Linux with systemd user services)')
     home = Path.home()
-    # Keep the existing config and state locations for seamless upgrades.
     config = home / '.config/vault-agents-watcher.env'
     target = home / '.local/share/vault-agents'
     unit = home / '.config/systemd/user/vault-agents-watcher.service'

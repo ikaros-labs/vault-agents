@@ -2,8 +2,7 @@
 
 Read this guide completely before installing. The goal is a working Linux user
 service that watches the user's existing Obsidian vault and dispatches their
-chosen agent CLI. Read [AGENTS.md](AGENTS.md) for runtime invariants; its host-specific
-legacy deployment paths are not prerequisites for new installations.
+chosen agent CLI. Read [AGENTS.md](AGENTS.md) for runtime invariants.
 
 If you have only this URL, clone https://github.com/ikaros-labs/vault-agents.git
 outside the vault. All commands below run from that checkout. Install from this
@@ -166,12 +165,8 @@ and sessions, and restarts the same service. A failed install exits nonzero;
 inspect the error and service state before retrying. Package updates are not
 transactional, so a failed update may require reinstalling a known-good revision.
 For rollback, check out that recorded revision in a separate checkout and run its
-installer. For a revision predating the installer, restore the legacy unit template
-from that revision and use its documented deployment procedure.
-
-Legacy `~/.hermes/scripts/` and `~/.hermes/venvs/vault-agents/` files are left in
-place during migration. The new unit takes over the same service name; config and
-session locations stay the same. Do not start a second watcher for the same vault.
+installer. Use revisions that support this installation workflow.
+Do not start a second watcher for the same vault.
 
 ## Remove
 
@@ -185,8 +180,7 @@ rm -rf "$HOME/.local/share/vault-agents/venv"
 ```
 
 Keep configuration, session history, the checkout, and vault notes unless the user
-also requests deletion of those. On a legacy installation, application files are
-under `~/.hermes` instead; inspect the unit before removing it to identify them.
+also requests deletion of those.
 
 ## Troubleshooting
 

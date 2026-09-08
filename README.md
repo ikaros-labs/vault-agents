@@ -78,9 +78,7 @@ prerequisites; it does not test provider authentication.
 
 Existing `~/.config/vault-agents-watcher.env` files are preserved byte-for-byte.
 For an existing installation, run `./install.sh` without `--vault`; edit that
-file directly to change the vault or CLI paths. Upgrading a legacy Hermes-directory
-installation replaces the same service unit and preserves its configuration and
-session state. Legacy application files remain available for rollback.
+file directly to change the vault or CLI paths.
 
 ### Configuration
 
@@ -134,12 +132,11 @@ To re-trigger a mention, edit its tag back to bare `@hermes` and save.
 After editing the Python sources here, run the regression tests, then:
 
 ```bash
-./deploy.sh
+./install.sh
 ```
 
 For updates from upstream, run `git pull --ff-only` and `./install.sh` in the
-checkout. `deploy.sh` uses the installer for new installations and keeps supporting
-legacy deployments in `~/.hermes/scripts/`. A restart interrupts active runs;
+checkout. A restart interrupts active runs;
 wait for pending acknowledgements to complete before upgrading.
 
 See [the agent guide](INSTALL_FOR_AGENTS.md#remove) for removal and rollback.

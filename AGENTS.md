@@ -4,8 +4,6 @@ Watcher daemon that turns `@hermes` / `@claude` / `@codex` mentions in an Obsidi
 
 For installing on a new host, follow [INSTALL_FOR_AGENTS.md](INSTALL_FOR_AGENTS.md).
 
-> Renamed from `obsidian-hermes` (2026-09) — it serves any agent, not just Hermes. All deployed artifacts (unit, script, venv, env file, state dir) migrated to the new names 2026-09-07.
-
 ## Layout
 
 | File | Purpose |
@@ -16,7 +14,6 @@ For installing on a new host, follow [INSTALL_FOR_AGENTS.md](INSTALL_FOR_AGENTS.
 | `install.sh` / `install.py` | Repeatable per-user package and service installation; `--check`, `--no-start` |
 | `pyproject.toml` | Python package metadata, dependency range, and CLI entrypoint |
 | `INSTALL_FOR_AGENTS.md` | Agent-facing installation and operations runbook |
-| `deploy.sh` | Copies both Python modules to the live path + restarts the systemd user unit |
 | `vault-agents-watcher.service` | systemd user unit template |
 | `example.env` | Template for the env file (VAULT_PATH + optional overrides) |
 
@@ -45,16 +42,16 @@ Telegram summary ping goes via `hermes send -t telegram:<TELEGRAM_CHAT_ID>`
 
 ## Source of truth vs live deployment
 
-Edit **here**, then run `./deploy.sh`. Never edit the live copy directly.
+Edit **here**, then run `./install.sh`. Never edit the live copy directly.
 
-New installs use `~/.local/share/vault-agents/venv/` and a generated systemd unit.
-`deploy.sh` detects that layout; otherwise it retains the legacy copy workflow below.
+The installer is the single supported installation and deployment workflow.
 The checked-in service file is an installer template, not directly copyable.
 
-- Legacy live script: `~/.hermes/scripts/vault-agents-watcher.py`
-- Venv: `~/.hermes/venvs/vault-agents/` (watchdog; requests no longer needed)
-- Unit: `systemctl --user status vault-agents-watcher` / `journalctl --user -u vault-agents-watcher`
-- Secrets: `~/.config/vault-agents-watcher.env` (deliberately OUTSIDE `~/.hermes`, which is a git-pushed backup repo)
+- Installed package and venv: `~/.local/share/vault-agents/venv/`
+- Unit: `~/.config/systemd/user/vault-agents-watcher.service`
+- Status: `systemctl --user status vault-agents-watcher`
+- Logs: `journalctl --user -u vault-agents-watcher`
+- Configuration: `~/.config/vault-agents-watcher.env` (private; never commit secrets)
 
 ## Behavior invariants (don't break these)
 
@@ -76,7 +73,7 @@ The checked-in service file is an installer template, not directly copyable.
 
 ## Testing a change
 
-1. Run `python -m unittest discover -s tests -v`, then `./deploy.sh`
+1. Run `python -m unittest discover -s tests -v`, then `./install.sh`
 2. Edit a vault note: flip an existing `/done` tag back to the bare tag, save.
 3. Watch `journalctl --user -u vault-agents-watcher -f` for pickup/ack/dispatch.
 4. For session continuity: mention with a fact in one save, ask for it back in a second mention, verify the reply and `sessions.json`.
