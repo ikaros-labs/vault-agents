@@ -1,0 +1,13 @@
+[Unit]
+Description=vault-agents mention watcher (@hermes/@claude/@codex in Obsidian notes)
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=@ENVIRONMENT_FILE@
+ExecStart=@EXEC_START@
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
