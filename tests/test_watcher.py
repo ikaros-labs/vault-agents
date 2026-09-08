@@ -23,8 +23,9 @@ class WatcherTests(unittest.TestCase):
         self.addCleanup(patch.stopall)
         self.path = self.root / 'note.md'
 
-    def request(self, agent='claude', ident='one'):
-        return Request(agent, ident, 'request', 'context')
+    def request(self, agent='claude', ident='one', acked_line=None, ordinal=0):
+        acked_line = acked_line if acked_line is not None else f'@{agent}/ack request'
+        return Request(agent, ident, 'request', 'context', acked_line, ordinal)
 
     def test_markdown_delimiters(self):
         for text in ['``@hermes example``', '````md\n```python\n@hermes example\n```\n````',
@@ -64,36 +65,48 @@ class WatcherTests(unittest.TestCase):
         for request in captured:
             self.assertFalse(w.MENTION_RE.search(request.line))
             self.assertFalse(w.MENTION_RE.search(request.context))
-            self.assertNotIn('vault-agent:', request.context)
             self.assertIn('@codex/done still typing', request.context)
         self.assertEqual(captured[0].line, 'first @claude/done second')
         self.assertIn('@codex still typing', self.path.read_text())
 
-    def test_completion_removes_only_its_own_marker(self):
+    def test_no_marker_written_and_completion_flips_only_its_own_tag(self):
         for agent in ['hermes', 'claude', 'codex']:
             for ok in [True, False]:
                 with self.subTest(agent=agent, ok=ok):
-                    request = self.request(agent)
-                    other = self.request('hermes', 'other')
-                    self.path.write_text(f'@{agent}/ack {request.marker} task @hermes/ack {other.marker} next\n')
-                    w.complete_request(self.path, request, ok, f'answer {request.marker}')
+                    acked = f'@{agent}/ack task @hermes/ack next'
+                    request = self.request(agent, acked_line=acked, ordinal=0)
+                    self.path.write_text(acked + '\n')
+                    self.assertNotIn('<!--', self.path.read_text())
+                    w.complete_request(self.path, request, ok, 'answer')
                     result = self.path.read_text()
-                    self.assertNotIn(request.marker, result)
-                    self.assertIn(other.marker, result)
                     self.assertIn(f"@{agent}/{'done' if ok else 'err'} task", result)
+                    self.assertIn('@hermes/ack next', result)
 
-    def test_hermes_rewrite_and_already_done_remove_marker(self):
+    def test_same_line_ordinal_targets_second_tag(self):
+        acked = '@claude/ack first @claude/ack second'
+        request = self.request('claude', acked_line=acked, ordinal=1)
+        self.path.write_text(acked + '\n')
+        w.complete_request(self.path, request, True, 'answer')
+        self.assertEqual(self.path.read_text().split('\n')[0],
+                         '@claude/ack first @claude/done second')
+
+    def test_edited_line_falls_back_to_first_ack(self):
+        request = self.request('claude', acked_line='@claude/ack original task')
+        self.path.write_text('@claude/ack reworded task\n')
+        w.complete_request(self.path, request, True, 'answer')
+        result = self.path.read_text()
+        self.assertIn('@claude/done reworded task', result)
+        self.assertIn('answer', result)
+
+    def test_hermes_rewrite_leaves_note_untouched(self):
         request = self.request('hermes')
-        for text, expected in [(f'[[result]] {request.marker}\n', '[[result]]\n'),
-                               (f'@hermes/done {request.marker} task\n', '@hermes/done task\n')]:
-            with self.subTest(text=text):
-                self.path.write_text(text)
-                w.complete_request(self.path, request, True, 'finished')
-                self.assertEqual(self.path.read_text(), expected)
+        self.path.write_text('[[result]]\n')
+        w.complete_request(self.path, request, True, 'finished')
+        self.assertEqual(self.path.read_text(), '[[result]]\n')
 
     def test_concurrent_replies_are_preserved(self):
         requests = [self.request('claude', 'one'), self.request('codex', 'two')]
-        self.path.write_text('\n'.join(f'@{r.agent}/ack {r.marker}' for r in requests))
+        self.path.write_text('\n'.join(r.acked_line for r in requests))
         barrier = threading.Barrier(2)
         def finish(request):
             barrier.wait()
@@ -117,7 +130,7 @@ class WatcherTests(unittest.TestCase):
 
     def test_worker_exception_finishes_as_error(self):
         request = self.request()
-        self.path.write_text(f'@claude/ack {request.marker}\n')
+        self.path.write_text(request.acked_line + '\n')
         with patch.dict(w.CLI_RUNNERS, {'claude': lambda _: (_ for _ in ()).throw(FileNotFoundError('missing'))}):
             w.dispatch_request(self.path, request)
         self.assertIn('@claude/err', self.path.read_text())
@@ -125,7 +138,7 @@ class WatcherTests(unittest.TestCase):
 
     def test_hermes_rename_failure_does_not_prevent_completion(self):
         request = self.request('hermes')
-        self.path.write_text(f'@hermes/ack {request.marker}\n')
+        self.path.write_text(request.acked_line + '\n')
         with patch.object(w, 'run_hermes', return_value=(True, 'finished', 'sid')), \
              patch.object(w.subprocess, 'run', side_effect=w.subprocess.TimeoutExpired('rename', 30)):
             w.dispatch_request(self.path, request)
@@ -169,7 +182,7 @@ class WatcherTests(unittest.TestCase):
 
     def test_completion_conflict_retries_without_rerunning_agent(self):
         request = self.request()
-        self.path.write_text(f'@claude/ack {request.marker}\n')
+        self.path.write_text(request.acked_line + '\n')
         with patch.dict(w.CLI_RUNNERS, {'claude': lambda _: (True, 'answer')}), \
              patch.object(w, 'complete_request', return_value=False):
             w.dispatch_request(self.path, request)
@@ -181,7 +194,7 @@ class WatcherTests(unittest.TestCase):
 
     def test_session_save_failure_still_completes(self):
         request = self.request('hermes')
-        self.path.write_text(f'@hermes/ack {request.marker}\n')
+        self.path.write_text(request.acked_line + '\n')
         with patch.object(w, 'run_hermes', return_value=(True, 'finished', 'sid')), \
              patch.object(w, 'register_sessions', side_effect=OSError('disk full')), \
              patch.object(w.subprocess, 'run'):

@@ -58,14 +58,17 @@ def find_mentions(lines):
 
 @dataclass(frozen=True)
 class Request:
+    """One dispatched mention. No in-note marker (vault hygiene): completion
+    anchors on `acked_line` (the full line text as written at ack time) and
+    `ordinal` (which @agent/ack occurrence on that line is ours, left to
+    right). If the line is edited mid-run, completion falls back to the first
+    remaining /ack tag for the agent anywhere in the note."""
     agent: str
     mention_id: str
     line: str
     context: str
-
-    @property
-    def marker(self):
-        return f'<!-- vault-agent:{self.mention_id} -->'
+    acked_line: str
+    ordinal: int
 
 
 def update_note(path: Path, transform):
