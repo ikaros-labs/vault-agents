@@ -1,6 +1,6 @@
 # vault-agents — agent guide
 
-Watcher daemon that turns `@hermes` / `@claude` / `@codex` mentions in an Obsidian vault into agent runs with inline replies. Single-file Python (`watcher.py`), no build step.
+Watcher daemon that turns `@hermes` / `@claude` / `@codex` mentions in an Obsidian vault into agent runs with inline replies. Python entrypoint (`watcher.py`) plus `vault_agents_note_runtime.py`, no build step.
 
 > Renamed from `obsidian-hermes` (2026-09) — it serves any agent, not just Hermes. All deployed artifacts (unit, script, venv, env file, state dir) migrated to the new names 2026-09-07.
 
@@ -8,8 +8,10 @@ Watcher daemon that turns `@hermes` / `@claude` / `@codex` mentions in an Obsidi
 
 | File | Purpose |
 |---|---|
-| `watcher.py` | The whole watcher: inotify (Python watchdog), debounce, mention regex, ack/done tag flips, direct CLI dispatch (`hermes chat` / `claude -p` / `codex exec`) in worker threads, per-note hermes session store, Telegram ping via `hermes send` |
-| `deploy.sh` | Copies `watcher.py` to the live path + restarts the systemd user unit |
+| `watcher.py` | Watcher orchestration: inotify (Python watchdog), debounce, mention regex, ack/done tag flips, direct CLI dispatch (`hermes chat` / `claude -p` / `codex exec`) in worker threads, per-note hermes session store, Telegram ping via `hermes send` |
+| `vault_agents_note_runtime.py` | Markdown parsing, request identity, serialized note updates, and per-path scheduling |
+| `tests/test_watcher.py` | Regression tests using temporary notes and mocked subprocesses |
+| `deploy.sh` | Copies both Python modules to the live path + restarts the systemd user unit |
 | `vault-agents-watcher.service` | systemd user unit template |
 | `example.env` | Template for the env file (VAULT_PATH + optional overrides) |
 
@@ -21,11 +23,14 @@ mentions), cwd=vault. The note→session map lives at
 `~/.local/state/vault-agents/sessions.json` (env `SESSION_STATE_PATH`),
 schema `{rel_note_path: {agent: {session_id, last_used}}}` — nested per-agent
 so claude/codex resume can be added later without migration. Lazy TTL expiry
-(`SESSION_TTL_HOURS`, default 72) on read. Per-note `threading.Lock`
-serializes same-note runs; different notes run in parallel. Fresh sessions
+(`SESSION_TTL_HOURS`, default 72) on read. Per-note write locks cover Hermes
+turns (new acknowledgements wait until the turn finishes); session locks also
+serialize inherited notes sharing a conversation. Independent sessions run in
+parallel. Fresh sessions
 get renamed `obsidian: <note name>` for a readable `hermes sessions list`.
-Spin-off inheritance: the prompt tells the agent it may register a note it
-creates by copying this note's entry in the state JSON to the new path key.
+Spin-off inheritance: Hermes emits `VAULT_INHERIT: ["inbox/new-note.md"]`
+in stdout. The watcher validates and registers paths after the turn returns;
+only the watcher writes session JSON.
 Stale session_id (pruned/deleted) → detected from stderr, auto-retries fresh.
 Telegram summary ping goes via `hermes send -t telegram:<TELEGRAM_CHAT_ID>`
 (bare lane, no thread). The webhook lane was REMOVED in v3.
@@ -62,7 +67,7 @@ Edit **here**, then run `./deploy.sh`. Never edit the live copy directly.
 
 ## Testing a change
 
-1. `./deploy.sh`
+1. Run `python -m unittest discover -s tests -v`, then `./deploy.sh`
 2. Edit a vault note: flip an existing `/done` tag back to the bare tag, save.
 3. Watch `journalctl --user -u vault-agents-watcher -f` for pickup/ack/dispatch.
 4. For session continuity: mention with a fact in one save, ask for it back in a second mention, verify the reply and `sessions.json`.

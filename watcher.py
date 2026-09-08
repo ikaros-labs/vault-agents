@@ -5,8 +5,8 @@ Watches the Obsidian vault for edits to *.md files. When a line contains a
 bare agent mention (@hermes, @claude, @codex — not .../ack, /done, /err), it:
   1. rewrites the tag -> @<agent>/ack in the note (dedup + visual receipt)
   2. dispatches the request by running the agent CLI as a subprocess in a
-     worker thread; the WATCHER writes the reply blockquote and flips
-     /ack -> /done (or /err).
+     worker thread; the watcher completes claude/codex replies and failures.
+     Hermes writes its own results, with a watcher tag-completion safety net.
 
 hermes gets PER-NOTE CONTINUOUS SESSIONS: the first mention in a note starts
 a session (`hermes chat -Q -q`), later mentions resume it (`--resume <id>`),
@@ -32,7 +32,6 @@ Optional:
 """
 
 import datetime
-import hashlib
 import json
 import logging
 import os
@@ -41,7 +40,10 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
+
+from vault_agents_note_runtime import MENTION_RE, Request, Scheduler, find_mentions, keyed_lock, update_note
 
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
@@ -64,12 +66,6 @@ CONTEXT_LINES = 20
 IGNORE_DIRS = {".git", ".obsidian", ".trash", "templates"}
 
 AGENTS = ("hermes", "claude", "codex")
-# Bare @<agent>: word boundary before, not followed by /ack|/done|/err, a word
-# char, or a hyphen (avoids e.g. @claude-plugins-official).
-MENTION_RE = re.compile(r"(?<![\w/])@(hermes|claude|codex)(?![-/\w])", re.IGNORECASE)
-# Inline code spans — mentions inside `backticks` are documentation, not requests.
-INLINE_CODE_RE = re.compile(r"`[^`]*`")
-
 CLI_PROMPT = """You are answering a mention inside the user's Obsidian note.
 Note file: {note_path}
 The request line: {mention_line}
@@ -121,11 +117,13 @@ and leave the vault better organized than you found it.
    yourself. You may also rewrite the mention fragment entirely (e.g.
    replace it with a [[wikilink]] on a todo line) — the preferred,
    human-like outcome; in that case no /done tag is needed. Either way:
-   after a successful run the note must contain no /ack-suffixed tag.
-5. If you CREATE a note and future mentions in it should continue THIS
-   conversation, register it: in the JSON file {state_path}, copy this
-   note's entry (key "{rel_path}") to a new key with the new note's
-   vault-relative path (keep all other keys intact).
+   preserve the request marker {marker} until the watcher removes it at
+   completion; change only THIS request tag.
+   Other pending requests must remain untouched.
+5. If you CREATE notes that should inherit this conversation, emit one stdout
+   line: VAULT_INHERIT: ["inbox/new-note.md"] (a JSON array of relative paths).
+   The watcher registers these AFTER your session is saved. Never edit the
+   session state JSON yourself.
 6. HARD RULES:
    - NEVER write a bare agent tag ("@" + agent name, no suffix) into any
      vault note — it retriggers the watcher. Use the /done form or a
@@ -142,11 +140,9 @@ logging.basicConfig(
 )
 log = logging.getLogger("vault-agents")
 
-# Trailing-line mentions waiting for the file to go quiet:
-#   path_str -> (full_text_sha1, first_seen_monotonic)
+# Pending trailing notes retain a text snapshot until their next scan clears it.
 _pending = {}
-_pending_timers = {}
-_pending_lock = threading.Lock()
+_completions = {}
 
 
 def is_ignored(path: Path) -> bool:
@@ -157,52 +153,33 @@ def is_ignored(path: Path) -> bool:
     return any(part in IGNORE_DIRS or part.startswith(".") for part in rel.parts[:-1]) or path.name.startswith(".")
 
 
-def mask_inline_code(line: str) -> str:
-    """Blank out `inline code` spans so mentions inside them don't match."""
-    return INLINE_CODE_RE.sub(lambda s: "`" + "·" * (len(s.group()) - 2) + "`", line)
-
-
-def ack_line(line: str) -> str:
-    """Flip the first real (non-code-span) bare mention to /ack."""
-    m = MENTION_RE.search(mask_inline_code(line))
-    if not m:
-        return line
-    return line[: m.start()] + f"@{m.group(1).lower()}/ack" + line[m.end():]
-
-
-def find_mentions(lines):
-    """Yield (line_index, line, agent) for bare mentions outside code fences."""
-    in_fence = False
-    for i, line in enumerate(lines):
-        stripped = line.lstrip()
-        if stripped.startswith("```") or stripped.startswith("~~~"):
-            in_fence = not in_fence
-            continue
-        if in_fence:
-            continue
-        m = MENTION_RE.search(mask_inline_code(line))
-        if m:
-            yield i, line, m.group(1).lower()
-
-
 # ------------------------------------------------------- hermes session store
 #
 # SESSION_STATE_PATH maps vault-relative note path -> per-agent session info:
 #   {"inbox/note.md": {"hermes": {"session_id": "...", "last_used": 1757250000}}}
 # Only "hermes" is populated today; schema is nested per-agent so claude/codex
-# resume can be added without migration. Re-read from disk on every access so
-# entries appended externally (e.g. by the agent registering a spin-off note)
-# are honored. Lazy TTL expiry on read.
+# resume can be added without migration. The watcher is the sole writer;
+# inheritance directives are applied after the turn finishes. Lazy TTL expiry.
 
 _state_lock = threading.Lock()
 
 
 def _load_sessions() -> dict:
     try:
-        return json.loads(SESSION_STATE_PATH.read_text(encoding="utf-8"))
+        state = json.loads(SESSION_STATE_PATH.read_text(encoding="utf-8"))
+        if not isinstance(state, dict):
+            raise ValueError("session state must be an object")
+        for note, agents in state.items():
+            if not isinstance(agents, dict):
+                raise ValueError(f"invalid session agents for {note}")
+            for entry in agents.values():
+                if (not isinstance(entry, dict) or not isinstance(entry.get("session_id"), str)
+                        or not isinstance(entry.get("last_used"), (int, float))):
+                    raise ValueError(f"invalid session entry for {note}")
+        return state
     except FileNotFoundError:
         return {}
-    except (OSError, json.JSONDecodeError) as e:
+    except (OSError, ValueError) as e:
         log.warning("session state unreadable (%s) — backing up and starting fresh", e)
         try:
             SESSION_STATE_PATH.replace(SESSION_STATE_PATH.with_suffix(".json.corrupt"))
@@ -233,26 +210,6 @@ def get_session_id(rel_path: str, agent: str = "hermes"):
             _save_sessions(state)
             return None
         return entry.get("session_id")
-
-
-def set_session(rel_path: str, session_id: str, agent: str = "hermes"):
-    with _state_lock:
-        state = _load_sessions()
-        state.setdefault(rel_path, {})[agent] = {
-            "session_id": session_id,
-            "last_used": time.time(),
-        }
-        _save_sessions(state)
-
-
-# Per-note locks: a resumed session must not run two turns concurrently.
-_note_locks: dict = {}
-_note_locks_guard = threading.Lock()
-
-
-def _note_lock(rel_path: str) -> threading.Lock:
-    with _note_locks_guard:
-        return _note_locks.setdefault(rel_path, threading.Lock())
 
 
 # ---------------------------------------------------------------- CLI agents
@@ -356,261 +313,196 @@ def notify_telegram(ok: bool, path: Path, reply: str):
         log.warning("telegram ping failed: %s", e)
 
 
-def finalize_hermes_tag(path: Path, acked_line: str) -> None:
-    """Safety net: if the /ack tag from this run still sits in the note
-    (agent finished but forgot to flip or rewrite it), flip it to /done.
-    The agent owns the note content; we only guarantee no /ack is left."""
-    try:
-        text = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
-        return
-    lines = text.split("\n")
-    try:
-        idx = lines.index(acked_line)
-    except ValueError:
-        return  # agent rewrote/removed the line — nothing to do
-    lines[idx] = re.sub(r"@hermes/ack", "@hermes/done", lines[idx], count=1, flags=re.IGNORECASE)
-    try:
-        path.write_text("\n".join(lines), encoding="utf-8")
-        log.info("safety-net: flipped forgotten /ack to /done in %s", path)
-    except OSError as e:
-        log.error("finalize_hermes_tag: cannot write %s: %s", path, e)
-
-
-def dispatch_hermes(path: Path, acked_line: str, context: str, mention_id: str):
-    """Run hermes with per-note session continuity.
-
-    The agent writes its own result into the vault (inline reply, edits,
-    new notes) and flips /ack itself — stdout is only the Telegram summary.
-    On failure the watcher writes the /err blockquote (agent may have died
-    before touching the note)."""
+def run_hermes_request(path: Path, request: Request):
     rel = str(path.relative_to(VAULT))
-    request_line = re.sub(r"@hermes/ack", "", acked_line, count=1, flags=re.IGNORECASE).strip()
     prompt = HERMES_PROMPT.format(
-        note_path=str(path), mention_line=request_line, context=context,
-        state_path=str(SESSION_STATE_PATH), rel_path=rel,
+        note_path=str(path), mention_line=request.line, context=request.context,
+        marker=request.marker,
     )
-    with _note_lock(rel):
+    # Hermes edits the note itself: hold the watcher write lock for its turn.
+    # A shared session lock also covers inherited notes with different paths.
+    with keyed_lock(("note", str(path))):
         sid = get_session_id(rel)
-        log.info("[hermes] %s running for %s (session=%s)", mention_id, rel, sid or "new")
-        t0 = time.monotonic()
-        ok, reply, out_sid = run_hermes(prompt, resume_id=sid)
-        log.info("[hermes] %s finished ok=%s in %.0fs (session=%s)",
-                 mention_id, ok, time.monotonic() - t0, out_sid or sid)
-        final_sid = out_sid or sid
-        if final_sid:
-            fresh = final_sid != sid
-            set_session(rel, final_sid)  # upsert also refreshes last_used
-            if fresh:
-                subprocess.run(
-                    [HERMES_BIN, "sessions", "rename", final_sid, f"obsidian: {path.stem}"],
-                    capture_output=True, timeout=30,
-                )
-    if ok:
-        finalize_hermes_tag(path, acked_line)
-    else:
-        write_reply(path, "hermes", acked_line, ok, reply)
-    notify_telegram(ok, path, reply)
+        with keyed_lock(("session", sid or rel)):
+            ok, reply, out_sid = run_hermes(prompt, resume_id=sid)
+            final_sid = out_sid or sid
+            summary, inherited = [], []
+            for line in reply.splitlines():
+                if line.startswith("VAULT_INHERIT:"):
+                    try:
+                        paths = json.loads(line.partition(":")[2])
+                        if not isinstance(paths, list) or not all(isinstance(p, str) for p in paths):
+                            raise ValueError("expected an array of note paths")
+                        inherited.extend(paths)
+                    except (ValueError, TypeError) as e:
+                        log.warning("invalid inheritance directive: %s", e)
+                else:
+                    summary.append(line)
+            if final_sid:
+                try:
+                    register_sessions(rel, final_sid, inherited if ok else [])
+                except (OSError, ValueError, TypeError):
+                    log.exception("could not save session for %s", rel)
+                if final_sid != sid:
+                    try:
+                        subprocess.run(
+                            [HERMES_BIN, "sessions", "rename", final_sid, f"obsidian: {path.stem}"],
+                            capture_output=True, timeout=30, check=True,
+                        )
+                    except (OSError, subprocess.SubprocessError):
+                        log.exception("could not name session %s", final_sid)
+            return ok, "\n".join(summary)
+
+
+def register_sessions(rel, sid, inherited):
+    paths = [rel]
+    for candidate in inherited:
+        path = (VAULT / candidate).resolve()
+        try:
+            relative = path.relative_to(VAULT.resolve())
+        except ValueError:
+            log.warning("inheritance path outside vault: %s", candidate)
+            continue
+        if path.suffix == ".md" and path.is_file() and not is_ignored(VAULT / relative):
+            paths.append(str(relative))
+    with _state_lock:
+        state = _load_sessions()
+        for path in paths:
+            state.setdefault(path, {})["hermes"] = {"session_id": sid, "last_used": time.time()}
+        _save_sessions(state)
 
 
 def _now_stamp() -> str:
     return datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
 
 
-def write_reply(path: Path, agent: str, acked_line: str, ok: bool, reply: str):
-    """Insert a blockquote reply under the acked mention line and flip its tag.
-
-    Locates the line by content (not index) so concurrent edits/sync can't
-    misplace the write. Retries once if the file changed underneath us.
-    """
+def complete_request(path: Path, request: Request, ok: bool, reply: str):
     status = "done" if ok else "err"
-    emoji = "🤖" if ok else "⚠️"
+    marker = re.compile(rf"[ \t]*{re.escape(request.marker)}")
+    pattern = re.compile(rf"@{request.agent}/(?:ack|done|err){marker.pattern}", re.I)
     body = reply if ok else f"agent run failed: {reply}"
-    quoted = "\n".join(f"> {ln}" if ln.strip() else ">" for ln in body.split("\n"))
-    block = f"> {emoji} **{agent}** ({_now_stamp()}):\n{quoted}"
+    quoted = "\n".join(f"> {line}" if line.strip() else ">" for line in body.splitlines())
+    block = f"> {'🤖' if ok else '⚠️'} **{request.agent}** ({_now_stamp()}):\n{quoted}\n"
 
-    for attempt in range(2):
+    def transform(text):
+        match = pattern.search(text)
+        if not match:
+            # Hermes may replace its request with a link. Never guess another tag.
+            if request.agent == "hermes" and ok:
+                return marker.sub("", text)
+            # Preserve results even if a user deleted the request anchor.
+            updated = text + f"\n\n> Request {request.mention_id} (original marker removed)\n" + block
+        else:
+            updated = text[:match.start()] + f"@{request.agent}/{status}" + text[match.end():]
+            if request.agent != "hermes" or not ok:
+                end = updated.find("\n", match.start())
+                if end < 0:
+                    end = len(updated)
+                updated = updated[:end] + "\n" + block + updated[end:]
+        # Also remove copies in an echoed reply or a rewritten Hermes fragment.
+        return marker.sub("", updated)
+
+    return update_note(path, transform)
+
+
+def dispatch_request(path: Path, request: Request):
+    log.info("[%s] %s running for %s", request.agent, request.mention_id, path)
+    try:
+        if request.agent == "hermes":
+            ok, reply = run_hermes_request(path, request)
+        else:
+            prompt = CLI_PROMPT.format(note_path=str(path), mention_line=request.line, context=request.context)
+            ok, reply = CLI_RUNNERS[request.agent](prompt)
+    except Exception as e:
+        log.exception("request %s failed", request.mention_id)
+        ok, reply = False, f"{type(e).__name__}: {e}"
+    with keyed_lock(("note", str(path))):
+        _completions.setdefault(str(path), []).append((request, ok, reply))
+        flush_completions(path)
+    if request.agent == "hermes":
+        notify_telegram(ok, path, reply)
+
+
+def flush_completions(path: Path):
+    """Retain results across transient edit conflicts without rerunning agents."""
+    pending = _completions.get(str(path), [])
+    remaining = []
+    for request, ok, reply in pending:
         try:
-            text = path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError) as e:
-            log.error("write_reply: cannot read %s: %s", path, e)
-            return False
-        lines = text.split("\n")
-        try:
-            idx = lines.index(acked_line)
-        except ValueError:
-            log.warning("write_reply: acked line not found in %s (edited away?)", path)
-            return False
-        lines[idx] = re.sub(rf"@{agent}/ack", f"@{agent}/{status}", lines[idx], count=1, flags=re.IGNORECASE)
-        lines.insert(idx + 1, block)
-        try:
-            # crude optimistic lock: re-read and compare before writing
-            if path.read_text(encoding="utf-8") != text:
-                log.info("write_reply: %s changed mid-write, retrying", path)
-                time.sleep(1.0)
+            if complete_request(path, request, ok, reply):
                 continue
-            path.write_text("\n".join(lines), encoding="utf-8")
-            return True
-        except OSError as e:
-            log.error("write_reply: cannot write %s: %s", path, e)
-            return False
-    return False
-
-
-def dispatch_cli(agent: str, path: Path, acked_line: str, context: str, mention_id: str):
-    """Run a CLI agent in a worker thread and write its reply back."""
-    request_line = re.sub(rf"@{agent}/ack", "", acked_line, count=1, flags=re.IGNORECASE).strip()
-    prompt = CLI_PROMPT.format(note_path=str(path), mention_line=request_line, context=context)
-    log.info("[%s] %s running for %s", agent, mention_id, path)
-    t0 = time.monotonic()
-    ok, reply = CLI_RUNNERS[agent](prompt)
-    log.info("[%s] %s finished ok=%s in %.0fs", agent, mention_id, ok, time.monotonic() - t0)
-    write_reply(path, agent, acked_line, ok, reply)
-
-
-# ------------------------------------------------------------------ core
-
-def _clear_pending(path_str: str):
-    with _pending_lock:
-        _pending.pop(path_str, None)
-        t = _pending_timers.pop(path_str, None)
-        if t:
-            t.cancel()
-
-
-def _schedule_recheck(path_str: str, delay: float):
-    with _pending_lock:
-        t = _pending_timers.pop(path_str, None)
-        if t:
-            t.cancel()
-        timer = threading.Timer(delay, _recheck, args=(path_str,))
-        timer.daemon = True
-        _pending_timers[path_str] = timer
-        timer.start()
-
-
-def _recheck(path_str: str):
-    with _pending_lock:
-        _pending_timers.pop(path_str, None)
-    p = Path(path_str)
-    if p.exists():
-        process_file(p)
+        except (OSError, UnicodeDecodeError):
+            log.exception("could not complete request %s", request.mention_id)
+        remaining.append((request, ok, reply))
+    if remaining:
+        _completions[str(path)] = remaining
+        scheduler.schedule(path, DEBOUNCE_SECONDS)
+    else:
+        _completions.pop(str(path), None)
 
 
 def process_file(path: Path, assume_finished: bool = False):
-    path_str = str(path)
-    try:
-        text = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError) as e:
-        log.warning("cannot read %s: %s", path, e)
-        return
+    with keyed_lock(("note", str(path))):
+        try:
+            flush_completions(path)
+            _process_file(path, assume_finished)
+        except (OSError, UnicodeDecodeError):
+            log.exception("cannot process %s", path)
+
+
+def quote_safe_mentions(text: str) -> str:
+    """Prompt excerpts must not plant new requests when quoted into a note."""
+    return MENTION_RE.sub(lambda match: f"@{match[1]}/done", text)
+
+
+def _process_file(path: Path, assume_finished: bool):
+    text = path.read_text(encoding="utf-8")
     lines = text.split("\n")
     hits = list(find_mentions(lines))
     if not hits:
-        _clear_pending(path_str)
+        _pending.pop(str(path), None)
         return
-
-    last_line_idx = len(lines) - 1
-    ready, trailing = [], []
-    for idx, line, agent in hits:
-        if assume_finished or idx < last_line_idx:
-            ready.append((idx, line, agent))
-        else:
-            trailing.append((idx, line, agent))
-
-    if trailing and not ready:
-        text_hash = hashlib.sha1(text.encode()).hexdigest()
-        now = time.monotonic()
-        with _pending_lock:
-            prev = _pending.get(path_str)
-        if prev and prev[0] == text_hash:
-            if now - prev[1] >= STABILITY_SECONDS:
-                log.info("trailing mention in %s stable for %.0fs -> dispatching", path, now - prev[1])
-                ready.extend(trailing)
-                trailing = []
-                _clear_pending(path_str)
-            else:
-                _schedule_recheck(path_str, STABILITY_SECONDS - (now - prev[1]) + 0.5)
-                return
-        else:
-            with _pending_lock:
-                _pending[path_str] = (text_hash, now)
-            log.info("trailing mention in %s — holding for %.0fs of quiet", path, STABILITY_SECONDS)
-            _schedule_recheck(path_str, STABILITY_SECONDS + 0.5)
+    now = time.monotonic()
+    previous_text, since = _pending.get(str(path), (None, now))
+    if text != previous_text:
+        since = now
+    _pending[str(path)] = (text, since)
+    ready = [(idx, match) for idx, match in hits
+             if assume_finished or idx < len(lines) - 1 or now - since >= STABILITY_SECONDS]
+    requests = []
+    prompt_lines = lines.copy()
+    for idx, match in reversed(ready):
+        agent = match[1].lower()
+        # Remove this request's tag; make other bare tags safe to quote, including
+        # trailing requests that have not been acknowledged yet. Use an immutable
+        # snapshot so another request's in-flight marker never enters the prompt.
+        line = prompt_lines[idx][:match.start()] + prompt_lines[idx][match.end():]
+        context = "\n".join(prompt_lines[max(0, idx-CONTEXT_LINES):idx+CONTEXT_LINES+1])
+        request = Request(agent, uuid.uuid4().hex, quote_safe_mentions(line).strip(),
+                          quote_safe_mentions(context))
+        lines[idx] = (lines[idx][:match.start()] + f"@{agent}/ack {request.marker}"
+                      + lines[idx][match.end():])
+        requests.append(request)
+    if ready:
+        if not update_note(path, lambda current: "\n".join(lines) if current == text else None):
+            scheduler.schedule(path, DEBOUNCE_SECONDS)
             return
-    elif not trailing:
-        _clear_pending(path_str)
+        # Our acknowledgement does not reset the trailing mention's quiet clock.
+        _pending[str(path)] = ("\n".join(lines), since)
+        for request in reversed(requests):
+            threading.Thread(target=dispatch_request, args=(path, request), daemon=True).start()
+    if len(ready) < len(hits):
+        scheduler.schedule(path, max(0.1, STABILITY_SECONDS - (now - since)))
 
-    if not ready:
-        return
 
-    # Ack the ready mentions (atomic-ish dedup), then dispatch each.
-    events = []
-    for idx, line, agent in ready:
-        mention_id = hashlib.sha1(f"{path}:{idx}:{line}:{time.time()}".encode()).hexdigest()[:10]
-        acked = ack_line(line)
-        lines[idx] = acked
-        lo, hi = max(0, idx - CONTEXT_LINES), min(len(lines), idx + CONTEXT_LINES + 1)
-        events.append({
-            "agent": agent,
-            "mention_id": mention_id,
-            "acked_line": acked,
-            "line_number": idx + 1,
-            "context": "\n".join(lines[lo:hi]),
-        })
-
-    # Sync-collision guard: verify the file hasn't changed since we read it.
-    try:
-        current = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError) as e:
-        log.warning("re-read failed for %s: %s — aborting ack", path, e)
-        return
-    if current != text:
-        log.info("%s changed while deciding — re-evaluating", path)
-        _schedule_recheck(path_str, DEBOUNCE_SECONDS)
-        return
-
-    try:
-        path.write_text("\n".join(lines), encoding="utf-8")
-    except OSError as e:
-        log.error("cannot write ack to %s: %s — skipping dispatch to avoid dup risk", path, e)
-        return
-
-    for ev in events:
-        agent = ev["agent"]
-        log.info("mention %s (@%s) in %s (line %d)", ev["mention_id"], agent, path, ev["line_number"])
-        target = dispatch_hermes if agent == "hermes" else dispatch_cli
-        args = ((path, ev["acked_line"], ev["context"], ev["mention_id"])
-                if agent == "hermes"
-                else (agent, path, ev["acked_line"], ev["context"], ev["mention_id"]))
-        worker = threading.Thread(target=target, args=args, daemon=True)
-        worker.start()
+scheduler = Scheduler(process_file)
 
 
 class Handler(FileSystemEventHandler):
-    def __init__(self):
-        self._timers = {}
-        self._lock = threading.Lock()
-
     def _schedule(self, path_str: str):
         path = Path(path_str)
-        if path.suffix != ".md" or is_ignored(path):
-            return
-        with self._lock:
-            t = self._timers.pop(path_str, None)
-            if t:
-                t.cancel()
-            timer = threading.Timer(DEBOUNCE_SECONDS, self._fire, args=(path_str,))
-            timer.daemon = True
-            self._timers[path_str] = timer
-            timer.start()
-
-    def _fire(self, path_str: str):
-        with self._lock:
-            self._timers.pop(path_str, None)
-        p = Path(path_str)
-        if p.exists():
-            process_file(p)
+        if path.suffix == ".md" and not is_ignored(path):
+            scheduler.schedule(path, DEBOUNCE_SECONDS)
 
     def on_modified(self, event):
         if not event.is_directory:
@@ -653,14 +545,15 @@ def main():
              "hermes sessions: %s, ttl %.0fh)",
              VAULT, ", ".join(AGENTS), DEBOUNCE_SECONDS, STABILITY_SECONDS,
              SESSION_STATE_PATH, SESSION_TTL_HOURS)
-    initial_scan()
     observer = Observer()
     observer.schedule(Handler(), str(VAULT), recursive=True)
     observer.start()
     try:
+        initial_scan()
         while True:
             time.sleep(60)
     finally:
+        scheduler.close()
         observer.stop()
         observer.join()
 
