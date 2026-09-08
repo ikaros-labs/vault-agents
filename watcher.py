@@ -28,7 +28,7 @@ Optional:
   CLI_TIMEOUT_SECONDS (default 600), HERMES_TIMEOUT_SECONDS (default 1200)
   SESSION_STATE_PATH (default ~/.local/state/vault-agents/sessions.json)
   SESSION_TTL_HOURS (default 72)
-  TELEGRAM_CHAT_ID (default 233267520; empty string disables pings)
+  TELEGRAM_CHAT_ID (default empty; disables pings)
 """
 
 import datetime
@@ -59,7 +59,7 @@ SESSION_STATE_PATH = Path(os.environ.get(
     os.path.expanduser("~/.local/state/vault-agents/sessions.json"),
 ))
 SESSION_TTL_HOURS = float(os.environ.get("SESSION_TTL_HOURS", "72"))
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "233267520")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 DEBOUNCE_SECONDS = 3.0
 STABILITY_SECONDS = 8.0  # quiet time required for a trailing-line mention
 CONTEXT_LINES = 20
@@ -555,8 +555,8 @@ def main():
     if not VAULT.is_dir():
         log.error("vault not found: %s", VAULT)
         sys.exit(1)
-    if not os.access(HERMES_BIN, os.X_OK):
-        log.error("hermes binary not found/executable: %s", HERMES_BIN)
+    if not any(os.access(binary, os.X_OK) for binary in (HERMES_BIN, CLAUDE_BIN, CODEX_BIN)):
+        log.error("no agent CLI found; configure HERMES_BIN, CLAUDE_BIN, or CODEX_BIN")
         sys.exit(1)
     log.info("watching %s (agents: %s; debounce %.0fs, trailing-line stability %.0fs; "
              "hermes sessions: %s, ttl %.0fh)",

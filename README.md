@@ -44,32 +44,45 @@ Requests are free-form: research, drafting, restructuring, reminders (the agent 
 - Force a fresh session: delete the note's entry from the state file.
 - claude/codex stay stateless one-shots (the state schema is per-agent-nested, so adding resume for them later needs no migration).
 
-## Requirements
+## Install
 
-- [Hermes Agent](https://github.com/NousResearch/hermes-agent) installed and configured (`hermes chat` working) — no gateway/webhook needed
-- Optionally `claude` / `codex` CLIs for those agents
-- Linux with systemd (user services) — the watcher uses inotify
-- Python 3.10+ and [uv](https://docs.astral.sh/uv/) (or any venv tooling)
+**Delegating to an agent?** Give it this instruction:
 
-## Setup
+> Install vault-agents following https://github.com/ikaros-labs/vault-agents/blob/main/INSTALL_FOR_AGENTS.md
 
-### 1. Install the watcher
+The complete [agent installation guide](INSTALL_FOR_AGENTS.md) covers discovery,
+configuration, verification, upgrades, and removal.
+
+Requirements: Linux with systemd user services, Python 3.10+, and at least one
+installed and authenticated agent CLI (`hermes`, `claude`, or `codex`). The installer
+uses `uv` when available, otherwise Python's `venv` and `pip` (some distributions
+require the `python3-venv` package). No root access is needed for the installation.
+
+Clone this repository **outside your vault**, then run:
 
 ```bash
-uv venv ~/.hermes/venvs/vault-agents
-uv pip install --python ~/.hermes/venvs/vault-agents/bin/python watchdog
-
-cp vault_agents_note_runtime.py ~/.hermes/scripts/vault_agents_note_runtime.py
-cp watcher.py ~/.hermes/scripts/vault-agents-watcher.py
-cp example.env ~/.config/vault-agents-watcher.env   # then edit: vault path (+ optional overrides)
-chmod 600 ~/.config/vault-agents-watcher.env
-cp vault-agents-watcher.service ~/.config/systemd/user/
-
-systemctl --user daemon-reload
-systemctl --user enable --now vault-agents-watcher
+git clone https://github.com/ikaros-labs/vault-agents.git
+cd vault-agents
+./install.sh --vault "/absolute/path/to/your/vault"
 ```
 
-### 2. Configure (env file)
+This installs the Python package and its declared dependencies in
+`~/.local/share/vault-agents/venv`, creates a private configuration file,
+detects CLI paths, and enables and starts the systemd user service. Starting the
+service immediately processes existing bare mentions throughout the vault.
+Telegram notifications are disabled until configured.
+
+To check prerequisites first, append `--check`. To install files without starting
+or restarting the service, append `--no-start`. `--check` validates local
+prerequisites; it does not test provider authentication.
+
+Existing `~/.config/vault-agents-watcher.env` files are preserved byte-for-byte.
+For an existing installation, run `./install.sh` without `--vault`; edit that
+file directly to change the vault or CLI paths. Upgrading a legacy Hermes-directory
+installation replaces the same service unit and preserves its configuration and
+session state. Legacy application files remain available for rollback.
+
+### Configuration
 
 | Var | Default | Purpose |
 |---|---|---|
@@ -83,9 +96,9 @@ systemctl --user enable --now vault-agents-watcher
 | `SESSION_TTL_HOURS` | `72` | session inactivity expiry |
 | `TELEGRAM_CHAT_ID` | — | chat for summary pings via `hermes send` (empty = off) |
 
-### 3. Test
+### Verify
 
-Drop `@hermes say hi` into a scratch note, save, and watch the tag flip to `/ack` then `/done` with an inline reply. Mention again in the same note — it remembers the first exchange.
+Write a short request for your configured agent in a scratch note, save with a trailing newline, and watch the tag flip to `/ack` then `/done` with an inline reply. For Hermes, mention again in the same note to verify session continuity.
 
 ## Behavior details
 
@@ -118,11 +131,18 @@ To re-trigger a mention, edit its tag back to bare `@hermes` and save.
 
 ## Deploying changes
 
-The live copy runs from `~/.hermes/scripts/`. After editing the Python sources here:
+After editing the Python sources here, run the regression tests, then:
 
 ```bash
 ./deploy.sh
 ```
+
+For updates from upstream, run `git pull --ff-only` and `./install.sh` in the
+checkout. `deploy.sh` uses the installer for new installations and keeps supporting
+legacy deployments in `~/.hermes/scripts/`. A restart interrupts active runs;
+wait for pending acknowledgements to complete before upgrading.
+
+See [the agent guide](INSTALL_FOR_AGENTS.md#remove) for removal and rollback.
 
 ## Regression tests
 

@@ -4,8 +4,8 @@ After=network.target
 
 [Service]
 Type=simple
-EnvironmentFile=%h/.config/vault-agents-watcher.env
-ExecStart=%h/.hermes/venvs/vault-agents/bin/python %h/.hermes/scripts/vault-agents-watcher.py
+EnvironmentFile=@ENVIRONMENT_FILE@
+ExecStart=@EXEC_START@
 Restart=on-failure
 RestartSec=10
 

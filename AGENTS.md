@@ -1,6 +1,8 @@
 # vault-agents — agent guide
 
-Watcher daemon that turns `@hermes` / `@claude` / `@codex` mentions in an Obsidian vault into agent runs with inline replies. Python entrypoint (`watcher.py`) plus `vault_agents_note_runtime.py`, no build step.
+Watcher daemon that turns `@hermes` / `@claude` / `@codex` mentions in an Obsidian vault into agent runs with inline replies. Python entrypoint (`watcher.py`) plus `vault_agents_note_runtime.py`, packaged with `pyproject.toml`.
+
+For installing on a new host, follow [INSTALL_FOR_AGENTS.md](INSTALL_FOR_AGENTS.md).
 
 > Renamed from `obsidian-hermes` (2026-09) — it serves any agent, not just Hermes. All deployed artifacts (unit, script, venv, env file, state dir) migrated to the new names 2026-09-07.
 
@@ -11,6 +13,9 @@ Watcher daemon that turns `@hermes` / `@claude` / `@codex` mentions in an Obsidi
 | `watcher.py` | Watcher orchestration: inotify (Python watchdog), debounce, mention regex, ack/done tag flips, direct CLI dispatch (`hermes chat` / `claude -p` / `codex exec`) in worker threads, per-note hermes session store, Telegram ping via `hermes send` |
 | `vault_agents_note_runtime.py` | Markdown parsing, request identity, serialized note updates, and per-path scheduling |
 | `tests/test_watcher.py` | Regression tests using temporary notes and mocked subprocesses |
+| `install.sh` / `install.py` | Repeatable per-user package and service installation; `--check`, `--no-start` |
+| `pyproject.toml` | Python package metadata, dependency range, and CLI entrypoint |
+| `INSTALL_FOR_AGENTS.md` | Agent-facing installation and operations runbook |
 | `deploy.sh` | Copies both Python modules to the live path + restarts the systemd user unit |
 | `vault-agents-watcher.service` | systemd user unit template |
 | `example.env` | Template for the env file (VAULT_PATH + optional overrides) |
@@ -42,7 +47,11 @@ Telegram summary ping goes via `hermes send -t telegram:<TELEGRAM_CHAT_ID>`
 
 Edit **here**, then run `./deploy.sh`. Never edit the live copy directly.
 
-- Live script: `~/.hermes/scripts/vault-agents-watcher.py`
+New installs use `~/.local/share/vault-agents/venv/` and a generated systemd unit.
+`deploy.sh` detects that layout; otherwise it retains the legacy copy workflow below.
+The checked-in service file is an installer template, not directly copyable.
+
+- Legacy live script: `~/.hermes/scripts/vault-agents-watcher.py`
 - Venv: `~/.hermes/venvs/vault-agents/` (watchdog; requests no longer needed)
 - Unit: `systemctl --user status vault-agents-watcher` / `journalctl --user -u vault-agents-watcher`
 - Secrets: `~/.config/vault-agents-watcher.env` (deliberately OUTSIDE `~/.hermes`, which is a git-pushed backup repo)

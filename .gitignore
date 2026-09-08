@@ -5,3 +5,6 @@ __pycache__/
 *.pyc
 .venv/
 .hermes/
+build/
+dist/
+*.egg-info/
