@@ -311,13 +311,14 @@ def notify_telegram(ok: bool, path: Path, reply: str):
         rel = str(path.relative_to(VAULT).with_suffix(""))
     except ValueError:
         rel = path.stem
-    msg = f"{status} obsidian · {path.stem}\n{summary}"
+    header = f"{status} obsidian · {path.stem}"
     if OBSIDIAN_VAULT_NAME:
         link = (
             "https://obsid.net/?vault=" + urllib.parse.quote(OBSIDIAN_VAULT_NAME)
             + "&file=" + urllib.parse.quote(rel, safe="")
         )
-        msg += f"\n{link}"
+        header = f"{status} obsidian · [{path.stem}]({link})"
+    msg = f"{header}\n{summary}"
     try:
         subprocess.run(
             [HERMES_BIN, "send", "-q", "-t", f"telegram:{TELEGRAM_CHAT_ID}", msg],
