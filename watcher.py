@@ -36,6 +36,7 @@ import json
 import logging
 import os
 import re
+import urllib.parse
 import subprocess
 import sys
 import threading
@@ -60,6 +61,10 @@ SESSION_STATE_PATH = Path(os.environ.get(
 ))
 SESSION_TTL_HOURS = float(os.environ.get("SESSION_TTL_HOURS", "72"))
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+# Obsidian vault display name for deep links in Telegram pings (obsid.net
+# redirects to obsidian:// which Telegram won't hyperlink directly).
+# Empty/unset → no link is appended.
+OBSIDIAN_VAULT_NAME = os.environ.get("OBSIDIAN_VAULT_NAME", "")
 DEBOUNCE_SECONDS = 3.0
 STABILITY_SECONDS = 8.0  # quiet time required for a trailing-line mention
 CONTEXT_LINES = 20
@@ -302,7 +307,17 @@ def notify_telegram(ok: bool, path: Path, reply: str):
         return
     status = "✅" if ok else "⚠️"
     summary = " ".join(reply.split())[:200]
+    try:
+        rel = str(path.relative_to(VAULT).with_suffix(""))
+    except ValueError:
+        rel = path.stem
     msg = f"{status} obsidian · {path.stem}\n{summary}"
+    if OBSIDIAN_VAULT_NAME:
+        link = (
+            "https://obsid.net/?vault=" + urllib.parse.quote(OBSIDIAN_VAULT_NAME)
+            + "&file=" + urllib.parse.quote(rel, safe="")
+        )
+        msg += f"\n{link}"
     try:
         subprocess.run(
             [HERMES_BIN, "send", "-q", "-t", f"telegram:{TELEGRAM_CHAT_ID}", msg],
